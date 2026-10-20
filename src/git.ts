@@ -62,6 +62,7 @@ export class Git {
       return execFileSync("git", ["-C", path, "rev-parse", "HEAD"], {
         cwd: this.cwd,
         encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
       }).trim();
     } catch {
       return null;
@@ -161,14 +162,23 @@ export class Git {
   }
 
   /**
-   * Create a non-destructive checkpoint commit (commit policy only). The caller
-   * must have already passed the scope/integrity gate. We never push, rebase,
-   * or alter history.
+   * Create a non-destructive checkpoint commit of the whole working tree
+   * (commit policy only). The caller must already have passed the mechanical
+   * gate over exactly this tree (git-derived changed files, deny-list, scope),
+   * and the commit policy requires a clean checkout at init, so everything
+   * staged here is gated feature work. A no-op when nothing changed (e.g. a
+   * crash-replayed outcome that was already committed). We never push,
+   * rebase, or alter history.
    */
-  commitCheckpoint(message: string, files: string[]): string {
-    if (files.length === 0) return this.head();
-    this.run(["add", "--", ...files]);
-    this.run(["commit", "-m", message]);
+  commitAll(message: string): string {
+    this.run(["add", "-A"]);
+    try {
+      execFileSync("git", ["diff", "--cached", "--quiet"], { cwd: this.cwd, stdio: "ignore" });
+      return this.head(); // exit 0: nothing staged
+    } catch {
+      // exit 1: staged changes to commit
+    }
+    this.run(["commit", "-q", "-m", message]);
     return this.head();
   }
 }

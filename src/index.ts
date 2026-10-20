@@ -9,6 +9,7 @@ import { CliHerdrAdapter, NullHerdrAdapter } from "./adapters/herdr.ts";
 import { doctor } from "./doctor.ts";
 import { openPrIfNone } from "./pr.ts";
 import { State } from "./types.ts";
+import { isOrthogonal } from "./stateMachine.ts";
 import type { RunConfig } from "./types.ts";
 import { progressLines } from "./progress.ts";
 import type { StepView } from "./progress.ts";
@@ -58,11 +59,24 @@ function makeController(): Controller {
   return makeStack().controller;
 }
 
+/**
+ * Exit (rather than die) on terminal signals so the process 'exit' hook in
+ * procs.ts terminates the detached Pi/test process groups we own. Anything
+ * that survives is detected by the next controller and reconciled.
+ */
+function exitOnSignals(): void {
+  const codes: [NodeJS.Signals, number][] = [["SIGINT", 130], ["SIGTERM", 143], ["SIGHUP", 129]];
+  for (const [sig, code] of codes) process.on(sig, () => process.exit(code));
+}
+
 /** Shared --deny/--commit/--strict/--level parsing for init and build. */
-function parseRunFlags(flags: Record<string, string | boolean>): { denyList: string[]; config: Partial<RunConfig> } {
+function parseRunFlags(
+  flags: Record<string, string | boolean>,
+  defaults: { commit?: boolean } = {},
+): { denyList: string[]; config: Partial<RunConfig> } {
   const denyList = typeof flags.deny === "string" ? flags.deny.split(",").map((s) => s.trim()).filter(Boolean) : [];
   const config: Partial<RunConfig> = {
-    ...(flags.commit ? { checkpointPolicy: "commit" as const } : {}),
+    ...(flags.commit || defaults.commit ? { checkpointPolicy: "commit" as const } : {}),
     ...(flags.strict ? { strictReviewPolicy: true } : {}),
     ...(typeof flags.level === "string" ? { reviewLevel: Number(flags.level) as 0 | 1 | 2 | 3 } : {}),
   };
@@ -122,6 +136,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === "build") {
+    exitOnSignals();
     await cmdBuild(flags);
     return;
   }
@@ -154,6 +169,7 @@ async function main(): Promise<void> {
       break;
     }
     case "run": {
+      exitOnSignals();
       const state = await ctl.run(requireId(_));
       process.stdout.write(`Run ${_[1]} settled in state: ${state}\n`);
       process.stdout.write(JSON.stringify(ctl.status(_[1]!), null, 2) + "\n");
@@ -165,18 +181,29 @@ async function main(): Promise<void> {
       if (flags.verbose || flags.v) printStatusDetails(ctl, id);
       break;
     }
-    case "pause":
-      ctl.pause(requireId(_));
-      process.stdout.write(`Paused ${_[1]}.\n`);
+    case "pause": {
+      const r = ctl.pause(requireId(_));
+      process.stdout.write(
+        r === "paused"
+          ? `Paused ${_[1]}.\n`
+          : `Pause requested for ${_[1]}; its live controller pauses once the current session finishes.\n`,
+      );
       break;
-    case "resume":
-      ctl.resume(requireId(_));
-      process.stdout.write(`Resumed ${_[1]}. Next: qfb run ${_[1]}\n`);
+    }
+    case "resume": {
+      const to = await ctl.resume(requireId(_));
+      process.stdout.write(`Resumed ${_[1]} -> ${to}. Next: qfb run ${_[1]} (or re-run 'qfb build ...')\n`);
       break;
-    case "stop":
-      ctl.stop(requireId(_));
-      process.stdout.write(`Stopped ${_[1]} (state preserved).\n`);
+    }
+    case "stop": {
+      const r = await ctl.stop(requireId(_));
+      process.stdout.write(
+        r === "stopped"
+          ? `Stopped ${_[1]}; it is in reconciliation (evidence preserved). Inspect the checkout, then qfb resume ${_[1]}.\n`
+          : `Stop requested for ${_[1]}; any active session was terminated and the live controller enters reconciliation.\n`,
+      );
       break;
+    }
     case "logs":
       process.stdout.write(`Artifacts: ${artifactRoot()}/${requireId(_)}\n`);
       break;
@@ -234,7 +261,9 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
   let run = store.findRun(repo, design, base);
   let runId: string;
   if (!run) {
-    const { denyList, config } = parseRunFlags(flags);
+    // A PR needs commits: unless --no-pr, checkpoints are commits of the
+    // gated tree, so the pushed HEAD is exactly what was reviewed.
+    const { denyList, config } = parseRunFlags(flags, { commit: !flags["no-pr"] });
     const res = ctl.init({ repoPath: repo, designPath: design, base, denyList, config });
     runId = res.runId;
     out(`Prepared ${runId}: ${res.steps} step(s) [strategy: ${res.strategy}].`);
@@ -271,12 +300,15 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
     }
     ctl.approve(runId);
     out(`Approved ${runId}.`);
-  } else if (run.state === State.PAUSED || run.state === State.BLOCKED) {
-    // Paused for a human decision or blocked on infra: do not silently resume.
+  } else if (isOrthogonal(run.state)) {
+    // Paused, blocked, failed, or in reconciliation: never silently resume.
     err(`Run ${runId} is ${run.state}: ${run.stopReason ?? "(no reason recorded)"}`);
     err(`Inspect/fix the checkout, then 'qfb resume ${runId}' and re-run 'qfb build ...'.`);
     process.exitCode = 2;
     return;
+  }
+  if (!flags["no-pr"] && run.config.checkpointPolicy !== "commit") {
+    out(`! ${runId} uses snapshot checkpoints: it can complete, but QFB will not push uncommitted work (use --no-pr, or start a new run).`);
   }
 
   // 4. Orchestrate to completion (resumes from persisted state), with a
@@ -288,7 +320,7 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
 
   if (state !== State.COMPLETED) {
     err(`\nRun ${runId} stopped in state '${state}': ${st.stopReason ?? ""}`);
-    err(`It is resumable \u2014 address the issue and re-run 'qfb build ...'.`);
+    err(`It is resumable \u2014 address the issue, then 'qfb resume ${runId}' and re-run 'qfb build ...'.`);
     process.exitCode = 2;
     return;
   }
@@ -303,8 +335,19 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
       `- Review iterations: ${st.reviews}\n` +
       `- Checkpoints: ${st.checkpoints}\n\n` +
       `See QFB artifacts at ${artifactRoot()}/${runId} for the full evidence trail.`;
-    const pr = openPrIfNone(repo, run.branch, prBase, title, body);
+    const final = store.getRun(runId)!;
+    const pr = openPrIfNone(repo, git, {
+      branch: final.branch,
+      prBase,
+      featureBase: final.baseRef,
+      title,
+      body,
+      accepted: ctl.acceptedCandidate(runId),
+      checkpointPolicy: final.config.checkpointPolicy,
+      denyList: final.denyList,
+    });
     out(pr.opened ? `\n\u2713 Opened PR: ${pr.url}` : `\nPR: ${pr.reason}${pr.url ? ` (${pr.url})` : ""}`);
+    if (!pr.opened && !pr.url) process.exitCode = 3;
   }
 
   out(`\n\u2713 Feature complete: ${runId}`);
@@ -390,13 +433,11 @@ async function runWithProgress(ctl: Controller, runId: string, enabled: boolean)
     }
   };
 
-  const onSigint = () => {
-    if (interactive) process.stdout.write("\x1b[?25h"); // restore cursor
-    process.exit(130);
-  };
+  // Signals exit via exitOnSignals(); restore the cursor on any exit path.
+  const restoreCursor = () => process.stdout.write("\x1b[?25h");
   if (interactive) {
     process.stdout.write("\x1b[?25l"); // hide cursor
-    process.on("SIGINT", onSigint);
+    process.on("exit", restoreCursor);
   }
   const interval = setInterval(paint, interactive ? 400 : 2000);
   interval.unref();
@@ -407,8 +448,8 @@ async function runWithProgress(ctl: Controller, runId: string, enabled: boolean)
     clearInterval(interval);
     paint(); // final frame
     if (interactive) {
-      process.stdout.write("\x1b[?25h");
-      process.removeListener("SIGINT", onSigint);
+      restoreCursor();
+      process.removeListener("exit", restoreCursor);
     }
   }
 }

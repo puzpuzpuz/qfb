@@ -9,10 +9,11 @@ import { extractPlan } from "../src/plan.ts";
 import { parseReviewReport, selectActionableFindings, isAcceptable, AmbiguousReportError } from "../src/report.ts";
 import { detectNoProgress, findingIdentity } from "../src/identity.ts";
 import { scanForDenyTerms } from "../src/confidentiality.ts";
-import { canTransition, assertTransition } from "../src/stateMachine.ts";
-import { mechanicalGate } from "../src/gating.ts";
+import { canTransition, assertTransition, resumeTarget } from "../src/stateMachine.ts";
+import { mechanicalGate, validateArtifact } from "../src/gating.ts";
+import type { GateInput } from "../src/gating.ts";
 import { State } from "../src/types.ts";
-import type { GitSnapshot, TaskArtifact } from "../src/types.ts";
+import type { GitSnapshot, TaskArtifact, VerifiedTest } from "../src/types.ts";
 
 const snap = (over: Partial<GitSnapshot> = {}): GitSnapshot => ({
   branch: "feature/x",
@@ -144,62 +145,94 @@ test("git: dirty fingerprint reflects untracked file CONTENT, not just names", (
   assert.notEqual(fp1, fp2);
 });
 
-test("stateMachine: rejects invalid transitions, allows orthogonal entry", () => {
+test("stateMachine: rejects invalid transitions, allows orthogonal entry and explicit recovery", () => {
   assert.equal(canTransition(State.CREATED, State.COMPLETED), false);
   assert.equal(canTransition(State.IMPLEMENTING, State.PAUSED), true);
   assert.equal(canTransition(State.COMPLETED, State.PAUSED), false);
   assert.throws(() => assertTransition(State.READY, State.COMPLETED));
+  // FAILED is recoverable by an explicit operator retry, back to the interrupted phase.
+  assert.equal(canTransition(State.FAILED, State.HARDENING_FIX_BUGS), true);
+  assert.equal(canTransition(State.PAUSED, State.REVIEWING), true);
+  assert.equal(canTransition(State.PAUSED, State.PAUSED), false);
+  // Hardening stages retry by looping on themselves; others do not.
+  assert.equal(canTransition(State.HARDENING_FIX_BUGS, State.HARDENING_FIX_BUGS), true);
+  assert.equal(canTransition(State.REVIEWING, State.REVIEWING), false);
+  assert.equal(resumeTarget(State.VERIFYING_STEP), State.IMPLEMENTING);
+  assert.equal(resumeTarget(State.FIXING), State.REVIEWING);
+  assert.equal(resumeTarget(State.HARDENING_WRITE_TESTS), State.HARDENING_WRITE_TESTS);
 });
 
-test("gating: passes clean DONE step", () => {
-  const r = mechanicalGate({
-    artifact: art(), sessionCompleted: true, before: snap(), after: snap(),
+const ok = (command = "mvn test", code = 0): VerifiedTest => ({ command, claimedExitCode: code, exitCode: code, logPath: "/l" });
+const gate = (over: Partial<GateInput> = {}) =>
+  mechanicalGate({
+    mode: "writer", artifact: art(), sessionCompleted: true, before: snap(), after: snap(),
     expectedBranch: "feature/x", allowedPathPrefixes: [], denyList: [],
-    changedFiles: ["src/Foo.java"], diffText: "",
+    changedFiles: ["src/Foo.java"], diffText: "", verifiedTests: [ok()], ...over,
   });
-  assert.equal(r.passed, true);
+
+test("gating: passes clean DONE step", () => {
+  assert.equal(gate().passed, true);
 });
 
 test("gating: fails on missing artifact, failed test, and dirty scope", () => {
-  assert.equal(mechanicalGate({ artifact: null, sessionCompleted: true, before: snap(), after: snap(), expectedBranch: "feature/x", allowedPathPrefixes: [], denyList: [], changedFiles: [], diffText: "" }).passed, false);
-
-  const failedTest = mechanicalGate({
-    artifact: art({ testCommands: [{ command: "mvn test", exitCode: 1, logPath: "/l" }] }),
-    sessionCompleted: true, before: snap(), after: snap(), expectedBranch: "feature/x",
-    allowedPathPrefixes: [], denyList: [], changedFiles: ["src/Foo.java"], diffText: "",
-  });
-  assert.equal(failedTest.passed, false);
+  assert.equal(gate({ artifact: null, verifiedTests: [] }).passed, false);
+  assert.equal(gate({ artifact: art({ testCommands: [{ command: "mvn test", exitCode: 1 }] }), verifiedTests: [ok("mvn test", 1)] }).passed, false);
 
   // Scope is enforced from the GIT-DERIVED changeset, not the agent's report:
   // the forbidden handoff file is present in git even though the artifact omits it.
-  const scope = mechanicalGate({
-    artifact: art({ changedFiles: ["src/Foo.java"] }),
-    sessionCompleted: true, before: snap(), after: snap(), expectedBranch: "feature/x",
-    allowedPathPrefixes: [], denyList: [], changedFiles: ["src/Foo.java", "handoff.md"], diffText: "",
-  });
+  const scope = gate({ changedFiles: ["src/Foo.java", "handoff.md"] });
   assert.equal(scope.passed, false);
   assert.equal(scope.pause, true);
+});
+
+test("gating: the controller's real exit code wins over the claim", () => {
+  const lie = gate({ verifiedTests: [{ command: "mvn test", claimedExitCode: 0, exitCode: 1, logPath: "/l" }] });
+  assert.equal(lie.passed, false);
+  assert.match(lie.failures.join(), /claims "mvn test" exited 0, but the controller's re-run exited 1/);
+  // Every claimed command must have been re-run.
+  assert.equal(gate({ verifiedTests: [] }).passed, false);
+});
+
+test("gating: failing tests are accepted only when the bugs they expose are recorded", () => {
+  const exposing = art({ testCommands: [{ command: "mvn test", exitCode: 1 }], bugs: [{ id: "B1", location: "", repro: "", failingTest: "T", observed: "", expected: "" }] });
+  assert.equal(gate({ artifact: exposing, verifiedTests: [ok("mvn test", 1)], allowFailingTestsWithBugs: true }).passed, true);
+  const unexplained = art({ testCommands: [{ command: "mvn test", exitCode: 1 }] });
+  assert.equal(gate({ artifact: unexplained, verifiedTests: [ok("mvn test", 1)], allowFailingTestsWithBugs: true }).passed, false);
+});
+
+test("gating: HEAD movement and branch changes pause", () => {
+  const moved = gate({ after: snap({ head: "h2" }) });
+  assert.equal(moved.passed, false);
+  assert.equal(moved.pause, true);
+  assert.equal(gate({ after: snap({ branch: "other" }) }).pause, true);
+});
+
+test("gating: read-only sessions must leave the checkout unchanged", () => {
+  assert.equal(gate({ mode: "read-only", verifiedTests: [] }).passed, true);
+  const touched = gate({ mode: "read-only", after: snap({ dirtyFingerprint: "other" }), verifiedTests: [] });
+  assert.equal(touched.passed, false);
+  assert.equal(touched.pause, true);
 });
 
 test("gating: confidentiality leak in working-tree diff content pauses the gate", () => {
   // The deny-listed term appears only in the diff CONTENT (not a file name and
   // not in the agent's self-reported changedFiles) \u2014 it must still be caught.
-  const r = mechanicalGate({
-    artifact: art(), sessionCompleted: true, before: snap(), after: snap(),
-    expectedBranch: "feature/x", allowedPathPrefixes: [], denyList: ["AcmeCorp"],
-    changedFiles: ["src/Foo.java"], diffText: "+ // for AcmeCorp rollout",
-  });
+  const r = gate({ denyList: ["AcmeCorp"], diffText: "+ // for AcmeCorp rollout" });
   assert.equal(r.passed, false);
   assert.equal(r.pause, true);
 });
 
 test("gating: submodule drift fails", () => {
-  const r = mechanicalGate({
-    artifact: art(), sessionCompleted: true, before: snap({ submoduleHead: "sub0" }),
-    after: snap({ submoduleHead: "sub1" }), expectedBranch: "feature/x",
-    allowedPathPrefixes: [], denyList: [], changedFiles: ["src/Foo.java"], diffText: "",
-  });
-  assert.equal(r.passed, false);
+  assert.equal(gate({ before: snap({ submoduleHead: "sub0" }), after: snap({ submoduleHead: "sub1" }) }).passed, false);
+});
+
+test("validateArtifact: rejects malformed artifacts instead of crashing the gate", () => {
+  assert.equal(validateArtifact(null), null);
+  assert.equal(validateArtifact({ status: "done" }), null);
+  assert.equal(validateArtifact({ status: "DONE", testCommands: "x" }), null);
+  assert.equal(validateArtifact({ status: "DONE", testCommands: [{ command: "mvn" }] }), null);
+  const a = validateArtifact({ status: "DONE", summary: "s" });
+  assert.deepEqual(a?.testCommands, []);
 });
 
 const THREE = `# Feature

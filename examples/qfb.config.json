@@ -17,5 +17,6 @@
   "maxHardeningFixIterations": 3,
   "maxNoProgress": 2,
   "maxTotalSessions": 200,
-  "sessionInactivityTimeoutMs": 1800000
+  "sessionInactivityTimeoutMs": 1800000,
+  "testTimeoutMs": 7200000
 }

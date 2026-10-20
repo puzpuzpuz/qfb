@@ -12,15 +12,18 @@ qfb build --repo /path/to/questdb --design ./feature-design.md \
           --deny "AcmeCorp,customer orders,trade_events" --yes
 ```
 
-It runs preflight, prepares and approves the plan, orchestrates implementation 
-detection → hardening → review/fix to completion, and opens a PR if none is open.
+It runs preflight, prepares and approves the plan, orchestrates implementation
+→ hardening → review/fix to completion, and opens a PR if none is open. Because a
+PR needs commits, `build` uses commit checkpoints (and therefore a clean checkout)
+unless you pass `--no-pr`; it pushes only the exact commit the final review
+accepted, and refuses a PR title/body containing deny-listed terms.
 
 **It is interruptible and resumable.** `build` keys off `(repo, design, base)` and
-resumes the existing run from its persisted state. If it is interrupted 
+resumes the existing run from its persisted state. If it is interrupted
 (Ctrl-C, crash, reboot), **re-run the identical command** — it continues from
-where it stopped and never repeats verified work. If it pauses for a decision or
-stops on a budget/no-progress condition, it prints the reason and the resumable
-next step; fix the issue and re-run `build` (or use the granular commands below).
+where it stopped and never repeats verified work. If it pauses for a decision,
+stops on a budget/no-progress condition, or needs reconciliation, it prints the
+reason; fix the issue, run `qfb resume RUN_ID`, and re-run `build`.
 
 Without `--yes`, `build` shows the normalized manifest and prompts for approval
 interactively; on a non-TTY it stops at the approval gate and tells you to pass
@@ -72,8 +75,11 @@ qfb init --repo /path/to/questdb \
   customer-specific table/column/schema names that must never appear in committed code, tests,
   comments, or identifiers. It lives only in QFB's state store. Any match in a changeset fails the
   scope/integrity gate and pauses the run.
-- `--commit` switches checkpoints from snapshot-only to real commits (QFB commits verified product
-  code only; never pushes, rebases, or touches PR metadata).
+- `--commit` switches checkpoints from snapshot-only to real commits: after every gated writer
+  session (implementation step, hardening write/fix, fix-pr) QFB commits the verified tree. It
+  requires a clean checkout at init (so nothing inherited is swept in), keeps deny-listed terms out
+  of commit messages, and never pushes (except `build`'s final PR step), rebases, or touches PR
+  metadata.
 - `--strict` makes the review loop resolve all actionable findings, not just Critical.
 - `--level` sets the `review-pr` level (0–3, default 2; use 3 for especially risky changes).
 
@@ -99,6 +105,12 @@ step, mechanically gated and checkpointed) → test-coverage hardening (identify
 adversarial tests → fix exposed bugs) → stabilization (`review-pr` ⇄ `fix-pr` until an acceptable
 verdict with a passing test gate) → `COMPLETED`.
 
+Agents report the validation commands they ran; QFB **re-runs every one itself**, one at a time,
+and gates on the real exit code (a claimed exit code that differs rejects the work). Logs land next
+to the session's artifact as `*.verify-N.log`. Each accepted command joins the run's regression
+suite (`artifacts/<run-id>/regression-suite.json`), which is re-run on the reviewed candidate before
+the run may complete.
+
 It runs unattended while decisions are routine. It **pauses** when it needs an architectural,
 product, compatibility, scope, or safety decision, and **fails** (preserving evidence) when a budget
 or no-progress condition is hit.
@@ -121,9 +133,17 @@ can watch live. Remember: a pane going idle is **not** proof of completion.
 
 ## 6. Intervene
 
-- `qfb pause RUN_ID` — request a safe pause (avoids interrupting an active write where possible).
-- `qfb resume RUN_ID` — reconcile (re-checks design integrity) and continue.
-- `qfb stop RUN_ID` — stop while preserving the uncertain state for reconciliation.
+- `qfb pause RUN_ID` — safe pause. If a controller is driving the run, the pause is *requested*
+  and taken after the current session finishes (an active write is never interrupted); otherwise it
+  is immediate.
+- `qfb stop RUN_ID` — forced stop: terminates the active session's whole process tree (Pi and any
+  Maven/JVM it started), saves the working-tree state to `*.interrupted.patch`, and puts the run in
+  `reconciliation`. The changes themselves stay in the checkout.
+- `qfb resume RUN_ID` — reconcile and continue: re-checks design integrity, refuses while any
+  earlier session is still running, and returns the run to the phase it was interrupted in (shown
+  as `resumeTo` in `qfb status`). Resuming a **failed** run is an explicit operator retry: failed
+  steps are re-opened and the attempt/iteration/session budgets start a fresh window (recorded as an
+  `operator-retry` transition). Restarting a controller never resets a budget by itself.
 
 When paused for a decision, `status` shows the `stopReason`. Inspect and, if needed, modify the
 checkout yourself, then `resume`. QFB never auto-approves permission dialogs, broad scope increases,
@@ -131,23 +151,38 @@ or destructive Git actions.
 
 ## 7. Recovery after a crash
 
-Just run `qfb run RUN_ID` (or `qfb resume`). The controller re-acquires the lock, re-reads durable
-state, inspects the repository and any in-flight session, and resumes only from a verified point.
-Because every logical operation has a stable ID and state transitions are atomic, a crash between
-code edits and checkpointing does **not** duplicate implementation work — the inherited changes are
-preserved and reconciled. Retry budgets persist across restarts.
+Just run `qfb run RUN_ID` (or re-run `build`). The controller re-acquires the lock, re-reads
+durable state, and checks every session the previous controller never saw end, using the pid it
+recorded:
+
+- **Still running** (e.g. the controller was `kill -9`ed but Pi lives on): the run enters
+  `reconciliation` and no second writer is started. Let it finish or `qfb stop` it, then
+  `qfb resume`.
+- **Gone**: its partial work is preserved (`*.interrupted.patch`) and left in the working tree, the
+  session is retired, and the phase continues with a fresh attempt that is told to build on those
+  changes rather than start over.
+
+A session that finished but whose outcome was never recorded is re-processed from its on-disk
+artifact, never relaunched; an outcome that *was* acted on is never replayed. On Ctrl-C/SIGTERM,
+QFB terminates the session it launched before exiting. Retry budgets persist across restarts.
 
 ## Stop conditions you may see
 
 - Review returned **needs-discussion** → paused for your decision.
-- `fix-pr` returned **Blocked / Diverging / Exhausted** → stopped (only *Clean* advances).
-- A **stale** test/review result after the checkout changed → paused; re-run.
-- The **review iteration limit** or **hard session ceiling** was reached → failed, resumable.
+- `fix-pr` returned **Blocked / Diverging / Exhausted**, or claimed *Clean* but its tests fail when
+  QFB re-runs them → failed (only a verified *Clean* advances).
+- A **stale** review result (the checkout changed during review) → paused; `qfb resume` reviews again.
+- The **final regression run** failed on the reviewed candidate → paused with the failing commands
+  and logs (if a command is obsolete, remove it from `regression-suite.json`), then `qfb resume`.
+- The **review iteration limit**, a **hardening budget**, or the **hard session ceiling** was
+  reached → failed; `qfb resume` grants an audited retry.
 - The **same blocker/bug identity** survived remediation without progress → failed, evidence preserved.
-- A **scope/confidentiality** violation (out-of-scope file, deny-listed name, orchestration artifact
-  staged) → paused.
+- A **scope/integrity/confidentiality** violation (out-of-scope file, deny-listed name, orchestration
+  artifact, HEAD/branch/submodule moved, a read-only stage that modified the tree) → paused.
+- A session from an earlier controller is **still running** → reconciliation.
 
 ## Completion
 
 On `COMPLETED`, `qfb status` reflects completed steps and review history; `qfb logs` points at the
-full evidence. QFB **does not** push, open/merge PRs, or deploy — that remains your decision.
+full evidence. `qfb run` **does not** push, open/merge PRs, or deploy — that remains your decision.
+`qfb build` (unless `--no-pr`) pushes the accepted commit and opens a PR, nothing else.

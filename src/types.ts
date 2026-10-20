@@ -83,13 +83,18 @@ export interface RunConfig {
   maxImplAttemptsPerStep: number;
   maxReviewIterations: number;
   maxInfraRetries: number;
+  /** Identify/write-test passes over the cumulative diff (outer hardening loop). */
   maxHardeningGapPasses: number;
+  /** Attempts per hardening identify / write-tests stage within one pass. */
   maxHardeningTestAttempts: number;
+  /** Bug-fix sessions per hardening pass before the run stops. */
   maxHardeningFixIterations: number;
   maxNoProgress: number;
   /** Mandatory hard ceiling on total Pi sessions per run (Section 11). */
   maxTotalSessions: number;
   sessionInactivityTimeoutMs: number;
+  /** Wall-clock limit for each test command the controller re-runs itself. */
+  testTimeoutMs: number;
   reviewLevel: 0 | 1 | 2 | 3;
   checkpointPolicy: "snapshot" | "commit";
   /** Resolve all actionable findings, not just Critical (Section 8). */
@@ -108,6 +113,7 @@ export const DEFAULT_CONFIG: RunConfig = {
   maxNoProgress: 2,
   maxTotalSessions: 200,
   sessionInactivityTimeoutMs: 30 * 60 * 1000,
+  testTimeoutMs: 2 * 60 * 60 * 1000,
   reviewLevel: 2,
   checkpointPolicy: "snapshot",
   strictReviewPolicy: false,
@@ -142,6 +148,8 @@ export interface TaskArtifact {
   fixOutcome?: FixOutcomeName;
   /** For kind=bug: bug-handoff entries this session recorded. */
   bugs?: BugEntry[];
+  /** Optional detailed handoff document (coverage-gap / bug report) outside the checkout. */
+  handoffPath?: string;
 }
 
 export interface BugEntry {
@@ -153,8 +161,17 @@ export interface BugEntry {
   expected: string;
 }
 
+/** A validation command as CLAIMED by the agent. Never trusted on its own. */
 export interface TestRun {
   command: string;
+  exitCode: number;
+  logPath?: string;
+}
+
+/** A claimed validation command re-run by the controller, with its REAL exit code. */
+export interface VerifiedTest {
+  command: string;
+  claimedExitCode: number;
   exitCode: number;
   logPath: string;
 }

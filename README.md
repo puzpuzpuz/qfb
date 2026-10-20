@@ -78,7 +78,9 @@ What `qfb build` does, in order:
 3. **Prepares** the plan — normalizes the design/handoff doc into QFB's canonical manifest.
 4. **Approves** it — interactively (shows the manifest and prompts) or non-interactively with `--yes`.
 5. **Orchestrates** serial implementation → hardening → review/fix → completion.
-6. **Opens a PR** for the branch if none is open (disable with `--no-pr`).
+6. **Opens a PR** for the branch if none is open (disable with `--no-pr`). It pushes only the exact
+   commit the final review accepted, from a clean tree, and refuses PR text containing deny-listed
+   terms. Because a PR needs commits, `build` uses commit checkpoints unless you pass `--no-pr`.
 
 While it runs, `build` shows a **self-refreshing compact progress view** — a
 phase bar (implementation ▸ hardening ▸ review/fix), per-step markers
@@ -90,8 +92,10 @@ prints a one-line update whenever progress changes.
 `(repo, design, base)` and the controller recovers from persisted state, so if it
 is interrupted (Ctrl-C, crash, machine reboot) you simply **re-run the exact same
 command** and it carries on from where it stopped — never duplicating verified
-work. When it pauses for a human decision or stops on a budget, it tells you what
-to fix; address it and re-run.
+work, and never starting a second writer next to a session that is still alive
+(that case enters `reconciliation`). When it pauses for a human decision, stops
+on a budget, or needs reconciliation, it tells you why: address it, run
+`qfb resume RUN_ID`, and re-run `build`.
 
 ### Useful `build` flags
 
@@ -101,11 +105,13 @@ to fix; address it and re-run.
 - `--no-pr` — complete without opening a PR; `--pr-title "..."` overrides the generated title.
 - `--skip-doctor` — skip preflight (not recommended for unattended runs).
 - `--commit`, `--strict`, `--level N`, `--deny a,b,c` — as in `init` (see the table below).
+  `--commit` is the default for `build` unless `--no-pr` is given; it requires a clean checkout.
 
 > **PR creation is an explicit deviation** from the spec's conservative default
 > (which never pushes or opens PRs). Running `qfb build` *is* that authorization,
-> and it happens only as the final step after the run reaches `COMPLETED`. Use
-> `--no-pr`, or the granular `qfb run` (which never pushes), to keep the
+> and it happens only as the final step after the run reaches `COMPLETED`, for the
+> accepted candidate only (same branch, same HEAD, same tree, nothing uncommitted).
+> Use `--no-pr`, or the granular `qfb run` (which never pushes), to keep the
 > conservative behavior.
 
 ### Granular / recovery commands
@@ -129,20 +135,25 @@ See [`examples/`](examples/) for a sample design document and configuration.
 |-------|----------|--------------|
 | **Preparation** | `PREPARING` | QFB reads the design/handoff doc and normalizes it into its canonical plan manifest, preserving original wording and order. Supports numbered lists, task checkboxes, **and `### Step N` heading-delimited plans**. The manifest is written to QFB's artifact store (never the checkout) and shown for approval. |
 | **B — Implementation** | `IMPLEMENTING → VERIFYING_STEP → CHECKPOINTING` | One fresh Pi session per plan step. The controller mechanically gates the result, then checkpoints. One writer at a time. |
-| **C — Hardening** | `HARDENING_IDENTIFY → HARDENING_WRITE_TESTS → HARDENING_FIX_BUGS` | Fresh sessions identify coverage gaps, write adversarial/fuzz/concurrency/fault-injection tests, and fix the bugs those tests expose. Bugs are recorded, not silently fixed; exposing tests are preserved. |
+| **C — Hardening** | `HARDENING_IDENTIFY → HARDENING_WRITE_TESTS → HARDENING_FIX_BUGS` | Fresh sessions identify coverage gaps (read-only), write adversarial/fuzz/concurrency/fault-injection tests, and fix the bugs those tests expose. Every stage is gated like an implementation step. Bugs are recorded, not silently fixed; exposing tests are preserved; open bugs never reach review — they are fixed within budget or the run stops. |
 | **D — Stabilization** | `REVIEWING → FIXING → VERIFYING_FIX → REVIEWING …` | QuestDB's `review-pr` runs against the cumulative diff; blocking findings go to `fix-pr`; loop until an acceptable verdict with passing test gate. |
-| **E — Completion** | `COMPLETED` | A summary of steps, changes, tests, review history, and outstanding non-blocking findings. **QFB never pushes, opens/merges PRs, or deploys.** |
+| **E — Completion** | `COMPLETED` | Every validation command accepted during the run is re-run on the reviewed candidate; only then does the run complete. `qfb run` never pushes; `qfb build` pushes the accepted commit and opens a PR (unless `--no-pr`). QFB never merges or deploys. |
 
 Orthogonal states — `paused`, `blocked`, `failed`, `reconciliation` — preserve evidence and have
-explicit recovery transitions. The **controller owns every transition rule**, never the LLM.
+explicit recovery transitions: `qfb resume` returns to the phase that was interrupted (resuming a
+`failed` run is an audited operator retry with a fresh budget window). The **controller owns every
+transition rule**, never the LLM; state changes are compare-and-set, so a concurrent change is
+refused rather than overwritten.
 
 ## The core safety property: two kinds of verification
 
-- **Mechanical gating (owned by QFB).** Objective facts only: the session completed, a typed handoff
-  artifact exists, the branch/checkout identity is intact, the submodule state is intended, no
-  out-of-scope or confidentiality-deny-listed changes occurred, required tests actually ran with
-  captured exit codes. A failed gate means the step is **not** done — regardless of what the agent
-  *claimed*.
+- **Mechanical gating (owned by QFB).** Objective facts only: the session completed, a valid typed
+  handoff artifact exists, the branch/HEAD/submodule are unchanged (agents never commit), no
+  out-of-scope or confidentiality-deny-listed changes occurred, and every claimed validation command
+  passes when **QFB re-runs it itself** — the real exit code decides, not the claim. Every session
+  is gated: writers (implementation, hardening write/fix, fix-pr) as above; read-only sessions
+  (coverage-gap identification, review) must leave the checkout byte-for-byte unchanged. A failed
+  gate means the work is **not** accepted — regardless of what the agent *claimed*.
 - **Semantic judgment (delegated).** Whether the code genuinely satisfies the prose acceptance
   criteria is established only by the Phase D `review-pr`/`fix-pr` loop over the cumulative diff. QFB
   never self-assesses this with heuristics or keyword matching.
@@ -160,7 +171,7 @@ An agent's `DONE` is a **claim, not a result** — it is only an input to the ga
 | `qfb approve RUN_ID` | Approve the frozen design + plan (freezes the design hash). |
 | `qfb run RUN_ID` | Execute the workflow to its next natural stopping point. |
 | `qfb status RUN_ID` | Phase, step progress, session, Git state, blockers, review iteration. |
-| `qfb pause / resume / stop RUN_ID` | Safe pause, reconcile-and-continue, evidence-preserving stop. |
+| `qfb pause / resume / stop RUN_ID` | Safe pause (a live controller pauses after its current session), reconcile-and-continue back to the interrupted phase (a `failed` run gets an audited retry), forced stop (kills the session's process tree, preserves evidence, enters `reconciliation`). |
 | `qfb logs RUN_ID` | Locate transcripts, test logs, review/fix reports. |
 | `qfb list` | List known runs. |
 
@@ -178,8 +189,9 @@ handoff documents, reports) are **never** committed to or `.gitignore`d in the Q
 **Parallel runs.** By default every run shares one `qfb.sqlite` (runs are rows keyed by `run_id`);
 only artifacts are split into per-run subdirs under `artifacts/<run-id>/`. Different features can run
 concurrently against this shared DB — SQLite WAL mode gives concurrent readers plus a serialized
-writer, a 5s `busy_timeout` absorbs simultaneous writes, and each process holds an exclusive
-per-`run_id` lock (a second process on the *same* run is refused). For full isolation, point each run
+writer, a 5s `busy_timeout` absorbs simultaneous writes, and each controller holds an exclusive
+lock on its run **and its checkout** (a second process on the *same* run, or a second run on the
+*same* checkout, is refused — one writer per checkout). For full isolation, point each run
 at its own store via `QFB_DB` / `QFB_ARTIFACTS` (trade-off: `list`/`status` then only see that run,
 and resuming requires re-passing the same `QFB_DB`). Keep the shared DB on a local filesystem, not
 NFS.
@@ -191,10 +203,14 @@ npm test          # deterministic unit + controller integration tests (Pi/Herdr 
 npm run typecheck # optional, requires the TypeScript devDependency
 ```
 
-The suite covers the Section 15 behaviors: serial one-writer execution, mechanical-gate rejections,
-design-edit invalidation, the review/fix loop, needs-discussion pauses, non-Clean fix outcomes,
+The suite covers the Section 15 behaviors: serial one-writer execution, mechanical-gate rejections
+(including claimed-vs-real test exit codes and HEAD movement), design-edit invalidation, gated
+hardening and fix-pr stages, the review/fix loop, needs-discussion pauses, non-Clean fix outcomes,
 stale-result rejection, iteration limits, finding/bug no-progress detection, the hard session
-ceiling, and lock exclusivity.
+ceiling, run and checkout lock exclusivity, pause/stop from another process, resume back to the
+interrupted phase, and crash recovery (a still-running session is never joined by a second writer;
+an outcome is re-processed but never replayed). `test/procs.test.ts` exercises the real
+process-group handling and push guard against real processes and a real git repo.
 
 A **real opt-in integration smoke test** against installed Pi/Herdr/QuestDB skills is the subject of
 Milestone 0 — see [`docs/FEASIBILITY.md`](docs/FEASIBILITY.md). Unit tests alone never establish

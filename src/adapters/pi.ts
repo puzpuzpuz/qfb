@@ -1,6 +1,7 @@
-import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { existsSync, createWriteStream } from "node:fs";
+import { hostname } from "node:os";
+import { spawnGroup, groupAlive, reapGroup, terminateGroup } from "../procs.ts";
 import type { TaskArtifact } from "../types.ts";
 
 /**
@@ -24,6 +25,12 @@ export interface PiLaunchRequest {
   /** Where the agent must write its typed artifact. */
   artifactPath: string;
   inactivityTimeoutMs: number;
+  /**
+   * Called as soon as the session process exists, with its pid (which is also
+   * its process-group id). The controller persists it so a restarted
+   * controller can tell whether the session is still running.
+   */
+  onSpawn?: (pid: number) => void;
 }
 
 export interface PiLaunchResult {
@@ -38,10 +45,23 @@ export interface PiLaunchResult {
   transcriptPath: string | null;
 }
 
+/** Durable identity of a launched session, as recorded in the state store. */
+export interface SessionRef {
+  sessionId: string;
+  pid: number | null;
+  host: string | null;
+}
+
 export interface PiAdapter {
   launch(req: PiLaunchRequest): Promise<PiLaunchResult>;
-  /** Check whether a session with this id is still actively running. */
-  isRunning(sessionId: string): Promise<boolean>;
+  /**
+   * Whether the session (Pi plus anything it spawned) may still be running.
+   * Must answer `true` whenever it cannot prove otherwise, so the controller
+   * never starts a second writer next to a live one.
+   */
+  isRunning(ref: SessionRef): Promise<boolean>;
+  /** Terminate the session's whole process tree. */
+  terminate(ref: SessionRef): Promise<void>;
 }
 
 async function readArtifact(path: string): Promise<TaskArtifact | null> {
@@ -55,23 +75,24 @@ async function readArtifact(path: string): Promise<TaskArtifact | null> {
 }
 
 /**
- * Real adapter using Pi's structured RPC/JSON mode (`pi --mode rpc -p`).
- * NOTE: Per Milestone 0 (Section 16) the RPC backend must be *proven* to
- * support the nested subagents used by review-pr/fix-pr before relying on it
- * for stabilization. See docs/FEASIBILITY.md.
+ * Real adapter using Pi's structured JSON mode (`pi --mode json --print`).
+ * NOTE: Per Milestone 0 (Section 16) this backend must be *proven* to support
+ * the nested subagents used by review-pr/fix-pr before relying on it for
+ * stabilization. See docs/FEASIBILITY.md.
  */
 export class RpcPiAdapter implements PiAdapter {
-  private readonly running = new Set<string>();
-
   async launch(req: PiLaunchRequest): Promise<PiLaunchResult> {
-    this.running.add(req.sessionId);
     const args = [
       "--mode", "json",
       "--print",
       "--session-id", req.sessionId,
       "--name", `qfb-${req.runId}-${req.stepId}`,
     ];
-    const child = spawn("pi", args, { cwd: req.cwd, stdio: ["pipe", "pipe", "pipe"] });
+    // Own process group: on timeout/stop we signal the whole tree, and on exit
+    // we reap strays (e.g. a Maven fork) so nothing overlaps the next writer.
+    const child = spawnGroup("pi", args, { cwd: req.cwd, stdio: ["pipe", "pipe", "pipe"] });
+    const pid = child.pid;
+    if (pid) req.onSpawn?.(pid);
 
     // CRITICAL: continuously drain stdout/stderr. If we leave them unread, a
     // verbose Pi session fills the OS pipe buffer (~64KB) and blocks forever.
@@ -80,16 +101,15 @@ export class RpcPiAdapter implements PiAdapter {
     const transcript = createWriteStream(transcriptPath, { flags: "a" });
 
     let timedOut = false;
-    let timer: NodeJS.Timeout;
+    let timer: NodeJS.Timeout | undefined;
     const resetInactivity = () => {
       clearTimeout(timer);
       timer = setTimeout(() => {
         // Inactivity (no output) exceeded the budget. A timeout is not proof of
-        // failure (Section 11); we terminate so the controller can reconcile
-        // and preserve any partial work/artifact rather than hang indefinitely.
+        // failure (Section 11); we terminate the whole tree so the controller
+        // can reconcile and preserve any partial work rather than hang.
         timedOut = true;
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+        if (pid) void terminateGroup(pid);
       }, req.inactivityTimeoutMs);
     };
     resetInactivity();
@@ -98,19 +118,25 @@ export class RpcPiAdapter implements PiAdapter {
       transcript.write(buf);
       resetInactivity(); // activity seen → reset the inactivity window
     };
-    child.stdout.on("data", onChunk);
-    child.stderr.on("data", onChunk);
+    child.stdout?.on("data", onChunk);
+    child.stderr?.on("data", onChunk);
 
-    child.stdin.write(req.prompt);
-    child.stdin.end();
+    child.stdin?.on("error", () => undefined); // EPIPE if Pi exits before reading
+    child.stdin?.end(req.prompt);
 
     const exitCode: number | null = await new Promise((resolve) => {
-      child.on("close", (code) => resolve(code));
+      let code: number | null = null;
       child.on("error", () => resolve(null));
+      child.on("exit", (c) => {
+        code = c;
+        if (pid) reapGroup(pid);
+        // Fallback in case a stray somehow keeps the pipes open.
+        setTimeout(() => resolve(code), 5000).unref();
+      });
+      child.on("close", () => resolve(code));
     });
-    clearTimeout(timer!);
-    transcript.end();
-    this.running.delete(req.sessionId);
+    clearTimeout(timer);
+    await new Promise<void>((r) => transcript.end(() => r()));
 
     const artifact = await readArtifact(req.artifactPath);
     return {
@@ -123,7 +149,17 @@ export class RpcPiAdapter implements PiAdapter {
     };
   }
 
-  async isRunning(sessionId: string): Promise<boolean> {
-    return this.running.has(sessionId);
+  async isRunning(ref: SessionRef): Promise<boolean> {
+    // No pid recorded: the controller died before the process was spawned (the
+    // pid is persisted immediately after spawn), so nothing can be running.
+    if (ref.pid === null) return false;
+    // Another host's process cannot be inspected from here; assume it lives.
+    if (ref.host !== null && ref.host !== hostname()) return true;
+    return groupAlive(ref.pid);
+  }
+
+  async terminate(ref: SessionRef): Promise<void> {
+    if (ref.pid === null || (ref.host !== null && ref.host !== hostname())) return;
+    await terminateGroup(ref.pid);
   }
 }

@@ -1,20 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, realpathSync } from "node:fs";
 import { writeFile, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { hostname } from "node:os";
+import { join, resolve } from "node:path";
 import { Store } from "./store.ts";
+import type { RunRow, SessionRow } from "./store.ts";
 import type { PaneLabel } from "./adapters/herdr.ts";
-import type { PiLaunchResult } from "./adapters/pi.ts";
-import { assertTransition } from "./stateMachine.ts";
+import type { PiLaunchResult, SessionRef } from "./adapters/pi.ts";
+import { assertTransition, isActive, isOrthogonal, resumeTarget } from "./stateMachine.ts";
 import { extractPlan } from "./plan.ts";
-import { mechanicalGate } from "./gating.ts";
+import { mechanicalGate, validateArtifact } from "./gating.ts";
 import { parseReviewReport, selectActionableFindings, isAcceptable, AmbiguousReportError } from "./report.ts";
 import { findingIdentity, bugIdentity, detectNoProgress } from "./identity.ts";
+import { scanForDenyTerms } from "./confidentiality.ts";
 import { Git } from "./git.ts";
+import { shellTestRunner } from "./procs.ts";
+import type { TestRunner } from "./procs.ts";
 import { State, AgentStatus, FixOutcome, DEFAULT_CONFIG } from "./types.ts";
 import type { PiAdapter } from "./adapters/pi.ts";
 import type { HerdrAdapter } from "./adapters/herdr.ts";
-import type { RunConfig, StateName, TaskArtifact, GitSnapshot } from "./types.ts";
+import type { RunConfig, StateName, TaskArtifact, GitSnapshot, VerifiedTest, ReviewReport } from "./types.ts";
 
 /** Minimal Git surface the controller depends on (injectable for tests). */
 export interface GitLike {
@@ -26,7 +31,8 @@ export interface GitLike {
   /** Git-derived diff content vs base (tracked diff + untracked contents). */
   workingDiff(base: string): string;
   isClean(): boolean;
-  commitCheckpoint(message: string, files: string[]): string;
+  /** Commit the (already gated) working tree; returns the new HEAD. */
+  commitAll(message: string): string;
 }
 
 export interface ControllerDeps {
@@ -37,6 +43,13 @@ export interface ControllerDeps {
   makeGit?: (repoPath: string) => GitLike;
   /** Root directory for durable artifacts (outside the QuestDB tree). */
   artifactRoot: string;
+  /** Re-runs claimed validation commands; defaults to `sh -c` in a process group. */
+  runTest?: TestRunner;
+  /**
+   * How long a restarted controller waits for a previous controller's session
+   * to finish dying (e.g. right after Ctrl-C) before declaring reconciliation.
+   */
+  orphanGraceMs?: number;
 }
 
 export interface InitOptions {
@@ -47,7 +60,32 @@ export interface InitOptions {
   denyList?: string[];
 }
 
+/** The candidate a successful review accepted; `build` pushes only this. */
+export interface AcceptedCandidate {
+  branch: string;
+  head: string;
+  fingerprint: string;
+}
+
 export class PauseSignal extends Error {}
+/** Unwinds the run loop after the controller already persisted a stop/reconciliation. */
+class HaltSignal extends Error {}
+
+const STOP_STATES: StateName[] = [State.COMPLETED, State.FAILED, State.PAUSED, State.BLOCKED, State.RECONCILIATION];
+const DESIGN_CHANGED = "Approved design changed after approval; re-approval required.";
+
+// Counter keys.
+const PAUSE_REQUEST = "request-pause";
+const STOP_REQUEST = "request-stop";
+/** Highest session row id at the last operator retry of a FAILED run; budgets count sessions after it. */
+const BUDGET_EPOCH = "budget-epoch";
+const ACCEPTED = "accepted-candidate";
+
+interface Obtained {
+  result: PiLaunchResult;
+  row: SessionRow;
+  before: GitSnapshot;
+}
 
 export class Controller {
   private readonly store: Store;
@@ -55,6 +93,14 @@ export class Controller {
   private readonly herdr: HerdrAdapter;
   private readonly makeGit: (repoPath: string) => GitLike;
   private readonly artifactRoot: string;
+  private readonly runTest: TestRunner;
+  private readonly orphanGraceMs: number;
+  /**
+   * Session whose outcome is being processed. The next state transition
+   * consumes it in the same transaction, so an outcome is acted on exactly
+   * once: a crash before that transition re-processes it; after, never again.
+   */
+  private inflight: number | null = null;
 
   constructor(deps: ControllerDeps) {
     this.store = deps.store;
@@ -62,6 +108,8 @@ export class Controller {
     this.herdr = deps.herdr;
     this.makeGit = deps.makeGit ?? ((p) => new Git(p));
     this.artifactRoot = deps.artifactRoot;
+    this.runTest = deps.runTest ?? shellTestRunner;
+    this.orphanGraceMs = deps.orphanGraceMs ?? 10_000;
   }
 
   // ---------------------------------------------------------------- init
@@ -87,6 +135,13 @@ export class Controller {
 
     const git = this.makeGit(opts.repoPath);
     const config: RunConfig = { ...DEFAULT_CONFIG, ...opts.config };
+    if (config.checkpointPolicy === "commit" && !git.isClean()) {
+      // Commit checkpoints stage the whole gated tree; inherited changes would be swept in.
+      throw new Error(
+        "The commit checkpoint policy requires a clean checkout (QFB commits each verified change set). " +
+          "Commit or stash your local changes first, or use snapshot checkpoints (omit --commit; for 'build', pass --no-pr).",
+      );
+    }
 
     this.store.createRun({
       id: runId,
@@ -128,59 +183,87 @@ export class Controller {
     };
   }
 
+  /** Approve (or re-approve after a design change) and freeze the design hash. */
   approve(runId: string): void {
-    const run = this.requireRun(runId);
-    if (run.state !== State.AWAITING_APPROVAL && run.state !== State.PAUSED) {
-      throw new Error(`Run ${runId} is not awaiting approval (state=${run.state}).`);
-    }
-    // Re-freeze design hash on (re-)approval.
-    const design = readFileSync(run.designPath, "utf8");
-    this.store.setDesignHash(runId, sha256(design));
-    this.store.setApproved(runId);
-    this.store.setStopReason(runId, null);
-    this.transition(runId, run.state, State.READY, "approve");
+    this.withRunLock(runId, () => {
+      const run = this.requireRun(runId);
+      if (run.state !== State.AWAITING_APPROVAL && run.state !== State.PAUSED) {
+        throw new Error(`Run ${runId} is not awaiting approval (state=${run.state}).`);
+      }
+      const hash = sha256(readFileSync(run.designPath, "utf8"));
+      this.store.tx(() => {
+        this.store.setDesignHash(runId, hash);
+        this.store.setApproved(runId);
+        this.store.setStopReason(runId, null);
+        this.reopenSteps(runId);
+        // Re-approval returns to the interrupted phase, not to the start.
+        const to = run.state === State.PAUSED ? this.resumeStateOf(runId) : State.READY;
+        this.transition(runId, run.state, to, "approve");
+      });
+    });
   }
 
   // ---------------------------------------------------------------- run loop
   /**
    * Execute the workflow to the next natural stopping point. Acquires the
-   * exclusive run lock; drives deterministic `advance()` calls until the run
-   * reaches a terminal, paused, blocked, or failed state.
+   * exclusive run + checkout lock, reconciles any session a previous
+   * controller left behind, then drives deterministic `advance()` calls until
+   * the run reaches a terminal, paused, blocked, failed, or reconciliation state.
    */
   async run(runId: string): Promise<StateName> {
-    if (!this.store.acquireLock(runId)) {
-      throw new Error(`Run ${runId} is locked by another controller instance.`);
+    const run0 = this.requireRun(runId);
+    const keys = [runId, repoLockKey(run0.repoPath)];
+    if (!this.store.acquireLock(keys)) {
+      throw new Error(
+        this.store.lockHolder(runId)
+          ? this.lockedMessage(runId)
+          : `Checkout ${run0.repoPath} is in use by another QFB run; only one writer may drive a checkout at a time.`,
+      );
     }
     try {
+      if (!run0.approved || [State.CREATED, State.PREPARING, State.AWAITING_APPROVAL].includes(run0.state as never)) {
+        throw new Error(`Run ${runId} is not approved (state=${run0.state}); run 'qfb approve ${runId}' first.`);
+      }
       // Design-integrity reconciliation (Section 5 / Section 14).
-      this.checkDesignIntegrity(runId);
+      if (this.designChanged(runId)) throw new PauseSignal(DESIGN_CHANGED);
+      // Crash recovery (Section 9): never start a writer next to a live one.
+      await this.reconcileInflight(runId);
+
       let guard = 0;
       while (guard++ < 10_000) {
         const run = this.requireRun(runId);
-        if ([State.COMPLETED, State.FAILED, State.PAUSED, State.BLOCKED].includes(run.state as never)) {
-          return run.state;
+        if (STOP_STATES.includes(run.state)) return run.state;
+        if (this.store.getCounter(runId, STOP_REQUEST) !== null) this.haltForStop(runId, null);
+        if (this.store.getCounter(runId, PAUSE_REQUEST) !== null) {
+          // Graceful: honored between sessions, never interrupting an active write.
+          this.stopRun(runId, State.PAUSED, "Operator requested pause.");
+          continue;
         }
-        if (this.store.getSessionCount(runId) >= run.config.maxTotalSessions) {
-          return this.stopRun(runId, State.FAILED, "Hard ceiling on total Pi sessions reached.");
+        if (this.sessionsSinceEpoch(runId) >= run.config.maxTotalSessions) {
+          this.stopRun(runId, State.FAILED, "Hard ceiling on total Pi sessions reached.");
+          continue;
         }
         await this.advance(runId);
       }
       throw new Error("Run loop exceeded guard limit.");
     } catch (e) {
       if (e instanceof PauseSignal) {
-        const cur = this.requireRun(runId).state;
-        if (cur !== State.PAUSED) this.transition(runId, cur, State.PAUSED, "pause", e.message);
-        this.store.setStopReason(runId, e.message);
+        this.stopRun(runId, State.PAUSED, e.message);
         return State.PAUSED;
       }
+      if (e instanceof HaltSignal) return this.requireRun(runId).state;
       throw e;
     } finally {
-      this.store.releaseLock(runId);
+      this.inflight = null;
+      this.store.releaseLock(keys);
     }
   }
 
   /** One deterministic controller decision based solely on persisted state. */
   private async advance(runId: string): Promise<void> {
+    if (this.inflight !== null) {
+      throw new Error(`internal: outcome of session row ${this.inflight} was never recorded`);
+    }
     const run = this.requireRun(runId);
     switch (run.state) {
       case State.READY:
@@ -200,16 +283,16 @@ export class Controller {
       case State.FIXING:
         await this.doFix(runId);
         return;
-      case State.VERIFYING_FIX:
-        this.transition(runId, State.VERIFYING_FIX, State.REVIEWING, "fix-verified");
-        return;
       case State.VERIFYING_STEP:
       case State.CHECKPOINTING:
-        // Crash recovery: these are transient intra-step states that are only
-        // ever persisted if the process died mid-step. Re-enter the
-        // implementation loop; the step re-runs idempotently (bounded by its
-        // attempt budget) rather than wedging the run.
+        // Outcomes are now recorded atomically through these states; they are
+        // only found persisted in stores written by older versions. Re-enter
+        // the step: its unconsumed session outcome is re-processed, not relaunched.
         this.transition(runId, run.state, State.IMPLEMENTING, "crash-recovery");
+        return;
+      case State.VERIFYING_FIX:
+        // Likewise legacy-only: re-review the current candidate.
+        this.transition(runId, State.VERIFYING_FIX, State.REVIEWING, "crash-recovery");
         return;
       default:
         throw new Error(`advance() called in non-actionable state ${run.state}`);
@@ -226,227 +309,356 @@ export class Controller {
       this.transition(runId, State.IMPLEMENTING, State.HARDENING_IDENTIFY, "all-steps-done");
       return;
     }
-
-    this.store.setStepStatus(runId, next.id, "active");
-    const attempts = this.store.incStepAttempts(runId, next.id);
     const git = this.makeGit(run.repoPath);
-    const before = git.snapshot(run.baseRef);
 
-    const completed = steps.filter((s) => s.status === "done").map((s) => s.id);
-    const artifactPath = this.artifactPath(runId, `${next.id}-attempt${attempts}.json`);
-    const sessionId = `${runId}-${next.id}-a${attempts}`;
+    let got = this.unconsumed(runId, "implementation", next.id);
+    if (!got) {
+      const attempts = this.store.tx(() => {
+        this.store.setStepStatus(runId, next.id, "active");
+        return this.store.incStepAttempts(runId, next.id);
+      });
+      const completed = steps.filter((s) => s.status === "done").map((s) => s.id);
+      const artifactPath = this.artifactPath(runId, `${next.id}-attempt${attempts}.json`);
+      got = await this.launchSession(run, git, {
+        kind: "implementation",
+        stepId: next.id,
+        sessionId: `${runId}-${next.id}-a${attempts}`,
+        artifactPath,
+        label: { feature: runId, phase: "IMPLEMENTING", stepId: next.id },
+        prompt: this.buildStepPrompt(run, next, completed, artifactPath, attempts),
+      });
+    }
 
-    const result = await this.runAgentSession({
-      runId,
-      stepId: next.id,
-      kind: "implementation",
-      sessionId,
-      artifactPath,
-      label: { feature: runId, phase: "IMPLEMENTING", stepId: next.id },
-      cwd: run.repoPath,
-      timeoutMs: run.config.sessionInactivityTimeoutMs,
-      prompt: this.buildStepPrompt(run.designPath, next, completed, artifactPath),
-    });
+    const { result, before, row } = got;
+    const a = result.artifact;
+    const claimed = a?.status;
 
+    // Claimed BLOCKED / NEEDS_DECISION route to orthogonal states (Section 6 table).
+    if (claimed === AgentStatus.NEEDS_DECISION) {
+      this.stopRun(runId, State.PAUSED, `Step ${next.id} needs a human decision: ${a?.summary ?? ""}`);
+      return;
+    }
+    if (claimed === AgentStatus.BLOCKED) {
+      this.store.tx(() => {
+        this.store.setStepStatus(runId, next.id, "blocked");
+        this.stopRun(runId, State.BLOCKED, `Step ${next.id} blocked: ${a?.summary ?? ""}`);
+      });
+      return;
+    }
+
+    const verified = claimed === AgentStatus.DONE && a ? await this.verifyTests(run, a, row) : [];
     const after = git.snapshot(run.baseRef);
     const gate = mechanicalGate({
-      artifact: result.artifact,
+      mode: "writer",
+      artifact: a,
       sessionCompleted: result.settled && !result.timedOut,
       before,
       after,
       expectedBranch: run.branch,
       allowedPathPrefixes: [],
       denyList: run.denyList,
-      changedFiles: safe(() => git.changedFiles(run.baseRef), result.artifact?.changedFiles ?? []),
+      changedFiles: safe(() => git.changedFiles(run.baseRef), a?.changedFiles ?? []),
       diffText: safe(() => git.workingDiff(run.baseRef), ""),
+      verifiedTests: verified,
     });
-
-    this.transition(runId, State.IMPLEMENTING, State.VERIFYING_STEP, "session-settled",
-      JSON.stringify({ claimed: result.artifact?.status, gate: gate.passed }));
-
-    const claimed = result.artifact?.status;
-
-    // Map claimed status → controller action AFTER mechanical gating (Section 6).
-    if (claimed === AgentStatus.NEEDS_DECISION) {
-      throw new PauseSignal(`Step ${next.id} needs a human decision: ${result.artifact?.summary ?? ""}`);
-    }
-    if (claimed === AgentStatus.BLOCKED) {
-      this.store.setStepStatus(runId, next.id, "blocked");
-      this.transition(runId, State.VERIFYING_STEP, State.BLOCKED, "agent-blocked", result.artifact?.summary);
-      return;
-    }
+    const reasons = claimed && claimed !== AgentStatus.DONE ? [`agent claimed ${claimed}: ${a?.summary ?? ""}`, ...gate.failures] : gate.failures;
+    const evidence = JSON.stringify({ claimed, gate: gate.passed, failures: reasons, tests: verified });
 
     if (gate.passed && claimed === AgentStatus.DONE) {
-      // Advance to checkpoint.
-      this.transition(runId, State.VERIFYING_STEP, State.CHECKPOINTING, "gate-passed");
-      this.checkpoint(runId, next.id, result.artifact!, git, after);
-      this.store.setStepStatus(runId, next.id, "done");
-      this.transition(runId, State.CHECKPOINTING, State.IMPLEMENTING, "checkpointed");
+      // Side effect first; the DB records below are one atomic batch. A crash in
+      // between replays this outcome, and commitAll() is then a no-op.
+      const head = this.checkpointCommit(run, git, next.id, a!.summary);
+      this.rememberTests(runId, verified);
+      this.store.tx(() => {
+        this.transition(runId, State.IMPLEMENTING, State.VERIFYING_STEP, "session-settled", evidence);
+        this.transition(runId, State.VERIFYING_STEP, State.CHECKPOINTING, "gate-passed");
+        this.store.recordCheckpoint(runId, next.id, head, after.dirtyFingerprint);
+        this.store.setStepStatus(runId, next.id, "done");
+        this.store.deleteCounter(runId, `gate-failures:${next.id}`);
+        this.transition(runId, State.CHECKPOINTING, State.IMPLEMENTING, "checkpointed");
+      });
       return;
     }
 
-    // Gate failed, or claim was FAILED → bounded retry; else fail.
-    if (gate.pause) {
-      throw new PauseSignal(`Step ${next.id} failed a scope/confidentiality gate: ${gate.failures.join("; ")}`);
-    }
-    if (attempts >= run.config.maxImplAttemptsPerStep) {
-      this.store.setStepStatus(runId, next.id, "failed");
-      this.stopRun(runId, State.FAILED, `Step ${next.id} exhausted ${attempts} attempts: ${gate.failures.join("; ")}`);
-      return;
-    }
-    // Remain the active step for a bounded correction attempt.
-    this.transition(runId, State.VERIFYING_STEP, State.IMPLEMENTING, "gate-failed-retry", gate.failures.join("; "));
-  }
-
-  private checkpoint(runId: string, stepId: string, artifact: TaskArtifact, git: GitLike, after: GitSnapshot): void {
-    const run = this.requireRun(runId);
-    let head = after.head;
-    if (run.config.checkpointPolicy === "commit") {
-      // Only genuine product code may be committed; gate already enforced scope.
-      head = git.commitCheckpoint(`[qfb] ${stepId}: ${artifact.summary}`.slice(0, 72), artifact.changedFiles);
-    }
-    this.store.recordCheckpoint(runId, stepId, head, after.dirtyFingerprint);
+    this.store.tx(() => {
+      this.transition(runId, State.IMPLEMENTING, State.VERIFYING_STEP, "session-settled", evidence);
+      this.store.setCounter(runId, `gate-failures:${next.id}`, JSON.stringify(reasons));
+      if (gate.pause) {
+        this.stopRun(runId, State.PAUSED, `Step ${next.id} failed a scope/integrity gate: ${reasons.join("; ")}`);
+        return;
+      }
+      const used = this.sessionsSinceEpoch(runId, { kind: "implementation", stepId: next.id });
+      if (used >= run.config.maxImplAttemptsPerStep) {
+        this.store.setStepStatus(runId, next.id, "failed");
+        this.stopRun(runId, State.FAILED, `Step ${next.id} exhausted ${used} attempt(s): ${reasons.join("; ")}`);
+        return;
+      }
+      // Remain the active step for a bounded correction attempt.
+      this.transition(runId, State.VERIFYING_STEP, State.IMPLEMENTING, "gate-failed-retry", reasons.join("; "));
+    });
   }
 
   // ------------------------------------------------- Phase C: hardening
+  /**
+   * identify (read-only) → write tests (writer) → fix bugs (writer, loops)
+   * → [next pass] → review. Every stage is mechanically gated; open bugs never
+   * reach Phase D: they are fixed, or the run stops with the evidence.
+   */
   private async doHardening(runId: string): Promise<void> {
     const run = this.requireRun(runId);
     const stage = run.state;
-    const stageKey = stage === State.HARDENING_IDENTIFY ? "identify" : stage === State.HARDENING_WRITE_TESTS ? "write" : "fix";
+    const key = stage === State.HARDENING_IDENTIFY ? "identify" : stage === State.HARDENING_WRITE_TESTS ? "write" : "fix";
+    const kind = `hardening-${key}`;
     const pass = this.store.getNumber(runId, "hardening-pass");
+    const stepId = `${key}-p${pass}`;
+    const readOnly = key === "identify";
+    const git = this.makeGit(run.repoPath);
 
-    const artifactPath = this.artifactPath(runId, `hardening-${stageKey}-p${pass}.json`);
-    const sessionId = `${runId}-harden-${stageKey}-p${pass}`;
-    const result = await this.runAgentSession({
-      runId, stepId: stageKey, kind: `hardening-${stageKey}`, sessionId, artifactPath,
-      label: { feature: runId, phase: stage, stepId: stageKey },
-      cwd: run.repoPath, timeoutMs: run.config.sessionInactivityTimeoutMs,
-      prompt: this.buildHardeningPrompt(run.designPath, stage, artifactPath),
+    let got = this.unconsumed(runId, kind, stepId);
+    if (!got) {
+      const n = this.store.countSessions(runId, { kind, stepId }) + 1;
+      const artifactPath = this.artifactPath(runId, `hardening-${key}-p${pass}-a${n}.json`);
+      got = await this.launchSession(run, git, {
+        kind,
+        stepId,
+        sessionId: `${runId}-harden-${key}-p${pass}-a${n}`,
+        artifactPath,
+        label: { feature: runId, phase: stage, stepId },
+        prompt: this.buildHardeningPrompt(run, stage, artifactPath, `gate-failures:${kind}:${stepId}`),
+      });
+    }
+
+    const { result, before, row } = got;
+    const a = result.artifact;
+    const claimed = a?.status;
+    if (claimed === AgentStatus.NEEDS_DECISION) {
+      this.stopRun(runId, State.PAUSED, `Hardening ${key} stage needs a human decision: ${a?.summary ?? ""}`);
+      return;
+    }
+    if (claimed === AgentStatus.BLOCKED) {
+      this.stopRun(runId, State.BLOCKED, `Hardening ${key} stage blocked: ${a?.summary ?? ""}`);
+      return;
+    }
+    if (key === "fix" && a?.fixOutcome && a.fixOutcome !== FixOutcome.CLEAN) {
+      this.stopRun(runId, State.FAILED,
+        `Hardening bug fix returned ${a.fixOutcome}; stopping normal progression (evidence: ${row.artifactPath}).`);
+      return;
+    }
+
+    const verified = !readOnly && claimed === AgentStatus.DONE && a ? await this.verifyTests(run, a, row) : [];
+    const after = git.snapshot(run.baseRef);
+    const gate = mechanicalGate({
+      mode: readOnly ? "read-only" : "writer",
+      artifact: a,
+      sessionCompleted: result.settled && !result.timedOut,
+      before,
+      after,
+      expectedBranch: run.branch,
+      allowedPathPrefixes: [],
+      denyList: run.denyList,
+      changedFiles: readOnly ? [] : safe(() => git.changedFiles(run.baseRef), a?.changedFiles ?? []),
+      diffText: readOnly ? "" : safe(() => git.workingDiff(run.baseRef), ""),
+      verifiedTests: verified,
+      allowFailingTestsWithBugs: true,
     });
+    const reasons = claimed && claimed !== AgentStatus.DONE ? [`agent claimed ${claimed}: ${a?.summary ?? ""}`, ...gate.failures] : gate.failures;
+    const evidence = JSON.stringify({ claimed, gate: gate.passed, failures: reasons, tests: verified });
 
-    // Each stage must produce a verified typed handoff before the next begins.
-    if (!result.artifact) {
-      throw new PauseSignal(`Hardening stage ${stageKey} produced no handoff artifact.`);
-    }
-    if (result.artifact.status === AgentStatus.NEEDS_DECISION) {
-      throw new PauseSignal(`Hardening stage ${stageKey} needs a human decision: ${result.artifact.summary}`);
-    }
-
-    if (stage === State.HARDENING_IDENTIFY) {
-      this.transition(runId, stage, State.HARDENING_WRITE_TESTS, "gap-handoff-verified");
+    if (!gate.passed || claimed !== AgentStatus.DONE) {
+      const budget = key === "fix" ? run.config.maxHardeningFixIterations : run.config.maxHardeningTestAttempts;
+      this.store.tx(() => {
+        if (gate.pause) {
+          this.stopRun(runId, State.PAUSED, `Hardening ${key} stage failed a scope/integrity gate: ${reasons.join("; ")}`);
+          return;
+        }
+        const used = this.sessionsSinceEpoch(runId, { kind, stepId });
+        if (used >= budget) {
+          this.stopRun(runId, State.FAILED,
+            `Hardening ${key} stage (pass ${pass}) exhausted ${used} attempt(s): ${reasons.join("; ")}`);
+          return;
+        }
+        this.store.setCounter(runId, `gate-failures:${kind}:${stepId}`, JSON.stringify(reasons));
+        this.transition(runId, stage, stage, "hardening-retry", evidence);
+      });
       return;
     }
-    if (stage === State.HARDENING_WRITE_TESTS) {
-      // Preserve exposed bugs; do not weaken tests.
-      const bugs = result.artifact.bugs ?? [];
-      this.store.setCounter(runId, "open-bugs", JSON.stringify(bugs));
-      this.transition(runId, stage, State.HARDENING_FIX_BUGS, "tests-written");
+
+    const bugs = a!.bugs ?? [];
+    if (key === "identify") {
+      this.store.tx(() => {
+        this.store.setCounter(runId, "hardening-gap-artifact", row.artifactPath);
+        this.transition(runId, stage, State.HARDENING_WRITE_TESTS, "gap-handoff-verified", evidence);
+      });
       return;
     }
 
-    // HARDENING_FIX_BUGS: check fix outcome + bug-identity no-progress.
-    const openBugs = JSON.parse(this.store.getCounter(runId, "open-bugs") ?? "[]") as {
-      id: string; location: string; repro: string;
-    }[];
-    const remaining = result.artifact.bugs ?? [];
-    const identities = remaining.map((b) => bugIdentity(b));
+    const head = this.checkpointCommit(run, git, `hardening-${key}-p${pass}`, a!.summary);
+    this.rememberTests(runId, verified);
+
+    if (key === "write") {
+      this.store.tx(() => {
+        this.store.recordCheckpoint(runId, stepId, head, after.dirtyFingerprint);
+        if (bugs.length === 0) {
+          // The adversarial tests found nothing: Phase C is complete.
+          this.transition(runId, stage, State.REVIEWING, "hardening-complete", evidence);
+          return;
+        }
+        this.store.setCounter(runId, "open-bugs", JSON.stringify(bugs));
+        this.store.setCounter(runId, "hardening-bug-artifact", row.artifactPath);
+        this.transition(runId, stage, State.HARDENING_FIX_BUGS, "tests-written", evidence);
+      });
+      return;
+    }
+
+    // key === "fix": `bugs` are the ones STILL open after this session.
+    const ids = bugs.map((b) => bugIdentity(b));
     const history = JSON.parse(this.store.getCounter(runId, "bug-identity-history") ?? "[]") as string[][];
-    const survivors = detectNoProgress(history, identities, run.config.maxNoProgress);
-    history.push(identities);
-    this.store.setCounter(runId, "bug-identity-history", JSON.stringify(history));
-
-    if (survivors.length > 0) {
-      this.stopRun(runId, State.FAILED, `Hardening bug(s) recur with unchanged identity (no progress): ${survivors.join(", ")}`);
-      return;
-    }
-
-    const fixIters = this.store.getNumber(runId, "hardening-fix-iters") + 1;
-    this.store.setNumber(runId, "hardening-fix-iters", fixIters);
-
-    if (remaining.length === 0) {
-      // Phase C complete → stabilization.
-      this.transition(runId, stage, State.REVIEWING, "hardening-complete");
-      return;
-    }
-    if (fixIters >= run.config.maxHardeningFixIterations) {
-      this.stopRun(runId, State.FAILED, `Hardening fix budget exhausted with ${remaining.length} bug(s) still failing.`);
-      return;
-    }
-    // Loop: another identify/write/fix pass within bounds.
-    if (pass + 1 >= run.config.maxHardeningGapPasses) {
-      this.transition(runId, stage, State.REVIEWING, "hardening-passes-exhausted");
-      return;
-    }
-    this.store.setNumber(runId, "hardening-pass", pass + 1);
-    this.store.setCounter(runId, "open-bugs", JSON.stringify(remaining));
-    void openBugs;
-    this.transition(runId, stage, State.HARDENING_IDENTIFY, "hardening-loop");
+    const survivors = detectNoProgress(history, ids, run.config.maxNoProgress);
+    history.push(ids);
+    this.store.tx(() => {
+      this.store.recordCheckpoint(runId, stepId, head, after.dirtyFingerprint);
+      this.store.setCounter(runId, "bug-identity-history", JSON.stringify(history));
+      if (bugs.length === 0) {
+        this.store.deleteCounter(runId, "open-bugs");
+        if (pass + 1 < run.config.maxHardeningGapPasses) {
+          // This pass exposed (and fixed) bugs: hunt again over the new code.
+          this.store.setNumber(runId, "hardening-pass", pass + 1);
+          this.transition(runId, stage, State.HARDENING_IDENTIFY, "hardening-next-pass", evidence);
+        } else {
+          this.transition(runId, stage, State.REVIEWING, "hardening-complete", evidence);
+        }
+        return;
+      }
+      this.store.setCounter(runId, "open-bugs", JSON.stringify(bugs));
+      if (survivors.length > 0) {
+        this.stopRun(runId, State.FAILED, `Hardening bug(s) recur with unchanged identity (no progress): ${survivors.join(", ")}`);
+        return;
+      }
+      const used = this.sessionsSinceEpoch(runId, { kind, stepId });
+      if (used >= run.config.maxHardeningFixIterations) {
+        this.stopRun(runId, State.FAILED,
+          `Hardening fix budget exhausted with ${bugs.length} bug(s) still failing: ${bugs.map((b) => b.id).join(", ")}`);
+        return;
+      }
+      this.transition(runId, stage, stage, "hardening-fix-retry", `${bugs.length} bug(s) still open`);
+    });
   }
 
   // ------------------------------------------------- Phase D: review/fix
   private async doReview(runId: string): Promise<void> {
     const run = this.requireRun(runId);
     const git = this.makeGit(run.repoPath);
-    const candidate = git.snapshot(run.baseRef);
-    const iteration = this.store.getReviews(runId).length + 1;
 
-    if (iteration > run.config.maxReviewIterations) {
-      // Do NOT auto-accept an incomplete review on hitting the cap (Section 8.2).
-      this.stopRun(runId, State.FAILED, `Review iteration limit (${run.config.maxReviewIterations}) reached without acceptance.`);
+    let got = this.unconsumed(runId, "review", "review");
+    if (!got) {
+      const used = this.sessionsSinceEpoch(runId, { kind: "review" });
+      if (used >= run.config.maxReviewIterations) {
+        // Do NOT auto-accept an incomplete review on hitting the cap (Section 8.2).
+        this.stopRun(runId, State.FAILED, `Review iteration limit (${run.config.maxReviewIterations}) reached without acceptance.`);
+        return;
+      }
+      const n = this.store.countSessions(runId, { kind: "review" }) + 1;
+      const artifactPath = this.artifactPath(runId, `review-${n}.json`);
+      got = await this.launchSession(run, git, {
+        kind: "review",
+        stepId: "review",
+        sessionId: `${runId}-review-${n}`,
+        artifactPath,
+        label: { feature: runId, phase: "REVIEWING", stepId: "review", reviewIteration: n },
+        prompt: this.buildReviewPrompt(run.baseRef, run.config.reviewLevel, artifactPath),
+      });
+    }
+
+    const { result, before } = got;
+    const a = result.artifact;
+    const candidate = git.snapshot(run.baseRef);
+    // Read-only gate: the review must not touch the checkout, so its verdict
+    // is about exactly this candidate.
+    const gate = mechanicalGate({
+      mode: "read-only",
+      artifact: a,
+      sessionCompleted: result.settled && !result.timedOut,
+      before,
+      after: candidate,
+      expectedBranch: run.branch,
+      allowedPathPrefixes: [],
+      denyList: run.denyList,
+      changedFiles: [],
+      diffText: "",
+      verifiedTests: [],
+    });
+    if (!gate.passed) {
+      this.stopRun(runId, State.PAUSED, `Review session rejected by the read-only gate: ${gate.failures.join("; ")}`);
       return;
     }
-
-    const artifactPath = this.artifactPath(runId, `review-${iteration}.json`);
-    const sessionId = `${runId}-review-${iteration}`;
-    const result = await this.runAgentSession({
-      runId, stepId: "review", kind: "review", sessionId, artifactPath,
-      label: { feature: runId, phase: "REVIEWING", stepId: "review", reviewIteration: iteration },
-      cwd: run.repoPath, timeoutMs: run.config.sessionInactivityTimeoutMs,
-      prompt: this.buildReviewPrompt(run.baseRef, run.config.reviewLevel, artifactPath),
-    });
-
-    if (!result.artifact?.reviewReportPath || !existsSync(result.artifact.reviewReportPath)) {
-      throw new PauseSignal("Review session did not preserve a raw review-pr report.");
+    if (!a!.reviewReportPath || !existsSync(a!.reviewReportPath)) {
+      this.stopRun(runId, State.PAUSED, "Review session did not preserve a raw review-pr report.");
+      return;
     }
-    const raw = await readFile(result.artifact.reviewReportPath, "utf8");
+    const raw = await readFile(a!.reviewReportPath, "utf8");
 
-    let report;
+    let report: ReviewReport;
     try {
       report = parseReviewReport(raw);
     } catch (e) {
       if (e instanceof AmbiguousReportError) {
-        throw new PauseSignal(`Review report ambiguous — cannot extract verdict/findings: ${e.message}`);
+        this.stopRun(runId, State.PAUSED, `Review report ambiguous — cannot extract verdict/findings: ${e.message}`);
+        return;
       }
       throw e;
     }
-
-    this.store.recordReview(runId, iteration, report.verdict, report.testGatePassed, result.artifact.reviewReportPath, candidate.dirtyFingerprint);
-
-    // Associate findings with the exact reviewed candidate; reject stale ones.
-    const liveCandidate = git.snapshot(run.baseRef);
-    if (liveCandidate.dirtyFingerprint !== candidate.dirtyFingerprint) {
-      throw new PauseSignal("Checkout changed during review; result is stale and cannot be accepted.");
-    }
+    const iteration = this.store.getReviews(runId).length + 1;
+    const record = () =>
+      this.store.recordReview(runId, iteration, report.verdict, report.testGatePassed, a!.reviewReportPath!, candidate.dirtyFingerprint);
 
     if (report.verdict === "needs-discussion") {
-      throw new PauseSignal("Review returned needs-discussion; a human decision is required.");
+      this.store.tx(() => {
+        record();
+        this.stopRun(runId, State.PAUSED, "Review returned needs-discussion; a human decision is required.");
+      });
+      return;
     }
 
     if (isAcceptable(report, run.config.strictReviewPolicy)) {
-      this.transition(runId, State.REVIEWING, State.COMPLETED, "review-accepted");
-      this.store.setStopReason(runId, null);
+      // Final mechanical test gate on the reviewed candidate: every validation
+      // command accepted during the run is re-run here by the controller.
+      const suite = await this.runRegressionSuite(run, got.row);
+      const final = git.snapshot(run.baseRef);
+      const failing = suite.filter((t) => t.exitCode !== 0);
+      this.store.tx(() => {
+        record();
+        if (final.dirtyFingerprint !== candidate.dirtyFingerprint || final.head !== candidate.head) {
+          this.stopRun(runId, State.PAUSED, "Checkout changed during final verification; the review result is stale and cannot be accepted.");
+          return;
+        }
+        if (failing.length > 0) {
+          this.stopRun(runId, State.PAUSED,
+            `Final regression run failed on the reviewed candidate: ${failing.map((t) => `"${t.command}" exit ${t.exitCode} (log: ${t.logPath})`).join("; ")}. ` +
+              `Fix the cause (or, if a command is obsolete, remove it from ${this.suitePath(runId)}), then 'qfb resume ${runId}'.`);
+          return;
+        }
+        const accepted: AcceptedCandidate = { branch: candidate.branch, head: candidate.head, fingerprint: candidate.dirtyFingerprint };
+        this.store.setCounter(runId, ACCEPTED, JSON.stringify(accepted));
+        this.store.setStopReason(runId, null);
+        this.transition(runId, State.REVIEWING, State.COMPLETED, "review-accepted",
+          JSON.stringify({ accepted, regression: suite.length }));
+      });
       return;
     }
 
     // Not acceptable, but nothing is mechanically fixable: the test gate failed
     // or the only findings are non-actionable (e.g. adjacent). Entering fix-pr
-    // with an empty authorized set would spin pointlessly \u2014 require a human.
+    // with an empty authorized set would spin pointlessly — require a human.
     const actionable = selectActionableFindings(report, run.config.strictReviewPolicy);
     if (actionable.length === 0) {
       const why = !report.testGatePassed
         ? "the review test gate failed"
         : "the review is not acceptable but produced no actionable findings";
-      throw new PauseSignal(`Cannot auto-remediate: ${why}; a human decision is required.`);
+      this.store.tx(() => {
+        record();
+        this.stopRun(runId, State.PAUSED, `Cannot auto-remediate: ${why}; a human decision is required.`);
+      });
+      return;
     }
 
     // No-progress detection over finding identity (Section 8.2).
@@ -454,79 +666,196 @@ export class Controller {
     const history = JSON.parse(this.store.getCounter(runId, "finding-identity-history") ?? "[]") as string[][];
     const survivors = detectNoProgress(history, ids, run.config.maxNoProgress);
     history.push(ids);
-    this.store.setCounter(runId, "finding-identity-history", JSON.stringify(history));
-    if (survivors.length > 0) {
-      this.stopRun(runId, State.FAILED, `Blocker(s) survive remediation without progress: ${survivors.join(", ")}`);
-      return;
-    }
-
-    // Stash selected findings for the fix session, then transition.
-    this.store.setCounter(runId, "pending-findings", JSON.stringify(actionable));
-    this.transition(runId, State.REVIEWING, State.FIXING, "blocking-findings");
+    this.store.tx(() => {
+      record();
+      this.store.setCounter(runId, "finding-identity-history", JSON.stringify(history));
+      if (survivors.length > 0) {
+        this.stopRun(runId, State.FAILED, `Blocker(s) survive remediation without progress: ${survivors.join(", ")}`);
+        return;
+      }
+      // Stash selected findings for the fix session, then transition.
+      this.store.setCounter(runId, "pending-findings", JSON.stringify(actionable));
+      this.transition(runId, State.REVIEWING, State.FIXING, "blocking-findings");
+    });
   }
 
   private async doFix(runId: string): Promise<void> {
     const run = this.requireRun(runId);
+    const git = this.makeGit(run.repoPath);
     const findings = JSON.parse(this.store.getCounter(runId, "pending-findings") ?? "[]");
-    const iteration = this.store.getReviews(runId).length;
-    const artifactPath = this.artifactPath(runId, `fix-${iteration}.json`);
-    const sessionId = `${runId}-fix-${iteration}`;
-    const result = await this.runAgentSession({
-      runId, stepId: "fix", kind: "fix", sessionId, artifactPath,
-      label: { feature: runId, phase: "FIXING", stepId: "fix", reviewIteration: iteration },
-      cwd: run.repoPath, timeoutMs: run.config.sessionInactivityTimeoutMs,
-      prompt: this.buildFixPrompt(findings, artifactPath),
-    });
 
-    const outcome = result.artifact?.fixOutcome;
+    let got = this.unconsumed(runId, "fix", "fix");
+    if (!got) {
+      const n = this.store.countSessions(runId, { kind: "fix" }) + 1;
+      const artifactPath = this.artifactPath(runId, `fix-${n}.json`);
+      got = await this.launchSession(run, git, {
+        kind: "fix",
+        stepId: "fix",
+        sessionId: `${runId}-fix-${n}`,
+        artifactPath,
+        label: { feature: runId, phase: "FIXING", stepId: "fix", reviewIteration: n },
+        prompt: this.buildFixPrompt(findings, artifactPath),
+      });
+    }
+
+    const { result, before, row } = got;
+    const a = result.artifact;
+    if (a?.status === AgentStatus.NEEDS_DECISION) {
+      this.stopRun(runId, State.PAUSED, `fix-pr needs a human decision: ${a.summary}`);
+      return;
+    }
+    const outcome = a?.fixOutcome;
     if (outcome !== FixOutcome.CLEAN) {
       // Only Clean may advance the normal workflow (Section 3).
       this.stopRun(runId, State.FAILED, `fix-pr returned ${outcome ?? "unknown"}; stopping normal progression.`);
       return;
     }
-    this.transition(runId, State.FIXING, State.VERIFYING_FIX, "fix-clean");
+
+    // A Clean claim is still only a claim: gate it like any other writer.
+    const verified = a!.status === AgentStatus.DONE ? await this.verifyTests(run, a!, row) : [];
+    const after = git.snapshot(run.baseRef);
+    const gate = mechanicalGate({
+      mode: "writer",
+      artifact: a,
+      sessionCompleted: result.settled && !result.timedOut,
+      before,
+      after,
+      expectedBranch: run.branch,
+      allowedPathPrefixes: [],
+      denyList: run.denyList,
+      changedFiles: safe(() => git.changedFiles(run.baseRef), a!.changedFiles),
+      diffText: safe(() => git.workingDiff(run.baseRef), ""),
+      verifiedTests: verified,
+    });
+    const reasons = a!.status !== AgentStatus.DONE ? [`agent claimed ${a!.status}: ${a!.summary}`, ...gate.failures] : gate.failures;
+    const evidence = JSON.stringify({ outcome, gate: gate.passed, failures: reasons, tests: verified });
+
+    if (!gate.passed || a!.status !== AgentStatus.DONE) {
+      this.store.tx(() => {
+        this.transition(runId, State.FIXING, State.VERIFYING_FIX, "fix-claimed-clean", evidence);
+        this.stopRun(runId, gate.pause ? State.PAUSED : State.FAILED,
+          `fix-pr claimed Clean but mechanical verification failed: ${reasons.join("; ")}`);
+      });
+      return;
+    }
+
+    const n = this.store.countSessions(runId, { kind: "fix" });
+    const head = this.checkpointCommit(run, git, `fix-${n}`, a!.summary);
+    this.rememberTests(runId, verified);
+    this.store.tx(() => {
+      this.transition(runId, State.FIXING, State.VERIFYING_FIX, "fix-clean", evidence);
+      this.store.recordCheckpoint(runId, `fix-${n}`, head, after.dirtyFingerprint);
+      this.transition(runId, State.VERIFYING_FIX, State.REVIEWING, "fix-verified");
+    });
   }
 
   // ---------------------------------------------------------------- control ops
-  pause(runId: string): void {
+  /**
+   * Request a safe pause. With no live controller the run pauses at once;
+   * otherwise the live controller pauses after its current session finishes
+   * (never interrupting an active write).
+   */
+  pause(runId: string): "paused" | "requested" {
     const run = this.requireRun(runId);
-    this.store.setStopReason(runId, "Operator requested pause.");
-    if (run.state !== State.PAUSED) {
-      this.transition(runId, run.state, State.PAUSED, "operator-pause");
-    }
-  }
-
-  resume(runId: string): void {
-    const run = this.requireRun(runId);
-    this.checkDesignIntegrity(runId);
-    if (run.state === State.PAUSED) {
-      this.transition(runId, State.PAUSED, State.READY, "operator-resume");
-      this.store.setStopReason(runId, null);
-      return;
-    }
-    if (run.state === State.BLOCKED) {
-      // The operator has addressed the blocker. Re-open any blocked step and
-      // re-enter the implementation loop so it is retried (bounded by its
-      // attempt budget). Evidence from the blocked attempt is preserved; the
-      // step must be reset to pending or the loop would skip it and wrongly
-      // advance to hardening.
-      for (const s of this.store.getSteps(runId)) {
-        if (s.status === "blocked") this.store.setStepStatus(runId, s.id, "pending");
+    if (!isActive(run.state)) throw new Error(`Run ${runId} is ${run.state}; nothing to pause.`);
+    if (this.store.acquireLock(runId)) {
+      try {
+        const cur = this.requireRun(runId);
+        if (!isActive(cur.state)) throw new Error(`Run ${runId} is ${cur.state}; nothing to pause.`);
+        this.stopRun(runId, State.PAUSED, "Operator requested pause.");
+      } finally {
+        this.store.releaseLock(runId);
       }
-      this.transition(runId, State.BLOCKED, State.IMPLEMENTING, "operator-unblock");
-      this.store.setStopReason(runId, null);
+      return "paused";
     }
+    this.store.setCounter(runId, PAUSE_REQUEST, this.store.now());
+    return "requested";
   }
 
-  stop(runId: string): void {
+  /**
+   * Forced stop: terminate the active session's process tree, preserve the
+   * partial work as evidence, and enter reconciliation (Section 10). With a
+   * live controller, it observes the request and records the stop itself.
+   */
+  async stop(runId: string): Promise<"stopped" | "requested"> {
     const run = this.requireRun(runId);
-    this.stopRun(runId, State.FAILED, "Operator stopped the run; state preserved for reconciliation.");
-    void run;
+    if (!isActive(run.state) && !isOrthogonal(run.state)) throw new Error(`Run ${runId} is ${run.state}; nothing to stop.`);
+    if (this.store.acquireLock(runId)) {
+      try {
+        const open = this.store.openSessions(runId);
+        for (const s of open) if (await this.pi.isRunning(ref(s))) await this.pi.terminate(ref(s));
+        const cur = this.requireRun(runId);
+        const git = this.makeGit(cur.repoPath);
+        const evidence = open.map((s) => this.preserveInterrupted(cur, git, s));
+        this.store.tx(() => {
+          for (const s of open) this.retireSession(s.rowId, "stopped");
+          this.store.deleteCounter(runId, STOP_REQUEST);
+          this.stopRun(runId, State.RECONCILIATION,
+            `Operator stopped the run${evidence.length ? `; partial changes preserved at ${evidence.join(", ")}` : ""}. ` +
+              `Inspect the checkout, then 'qfb resume ${runId}'.`);
+        });
+      } finally {
+        this.store.releaseLock(runId);
+      }
+      return "stopped";
+    }
+    this.store.setCounter(runId, STOP_REQUEST, this.store.now());
+    for (const s of this.store.openSessions(runId)) await this.pi.terminate(ref(s));
+    return "requested";
+  }
+
+  /**
+   * Reconcile and continue: leave an orthogonal state back to the phase that
+   * was interrupted. Refuses while any earlier session is still running.
+   * Resuming a FAILED run is an explicit operator retry: it re-opens failed
+   * steps and grants a fresh, audited budget window (budgets are never reset
+   * merely because a controller restarts).
+   */
+  async resume(runId: string): Promise<StateName> {
+    if (!this.store.acquireLock(runId)) throw new Error(this.lockedMessage(runId));
+    try {
+      const run = this.requireRun(runId);
+      if (!isOrthogonal(run.state)) throw new Error(`Run ${runId} is ${run.state}; nothing to resume.`);
+      if (this.designChanged(runId)) {
+        this.stopRun(runId, State.PAUSED, DESIGN_CHANGED);
+        throw new Error(`${DESIGN_CHANGED} Review the edited design, then 'qfb approve ${runId}'.`);
+      }
+      const open = this.store.openSessions(runId);
+      for (const s of open) {
+        if (await this.pi.isRunning(ref(s))) {
+          throw new Error(
+            `Session ${s.sessionId} (pid ${s.pid} on ${s.host}) is still running; wait for it to exit or 'qfb stop ${runId}' first.`,
+          );
+        }
+      }
+      const git = this.makeGit(run.repoPath);
+      const evidence = open.map((s) => this.preserveInterrupted(run, git, s));
+      const target = this.resumeStateOf(runId);
+      const retry = run.state === State.FAILED;
+      this.store.tx(() => {
+        for (const s of open) this.retireSession(s.rowId, "interrupted");
+        this.reopenSteps(runId);
+        if (retry) {
+          this.store.setNumber(runId, BUDGET_EPOCH, this.store.maxSessionRowId(runId));
+          this.store.deleteCounter(runId, "finding-identity-history");
+          this.store.deleteCounter(runId, "bug-identity-history");
+        }
+        this.store.deleteCounter(runId, PAUSE_REQUEST);
+        this.store.deleteCounter(runId, STOP_REQUEST);
+        this.store.setStopReason(runId, null);
+        this.transition(runId, run.state, target, retry ? "operator-retry" : "operator-resume",
+          JSON.stringify({ previousStopReason: run.stopReason, evidence }));
+      });
+      return target;
+    } finally {
+      this.store.releaseLock(runId);
+    }
   }
 
   status(runId: string): Record<string, unknown> {
     const run = this.requireRun(runId);
     const steps = this.store.getSteps(runId);
+    const requests = [PAUSE_REQUEST, STOP_REQUEST].filter((k) => this.store.getCounter(runId, k) !== null);
     return {
       runId,
       state: run.state,
@@ -535,6 +864,8 @@ export class Controller {
       branch: run.branch,
       baseRef: run.baseRef,
       stopReason: run.stopReason,
+      resumeTo: isOrthogonal(run.state) ? this.resumeStateOf(runId) : null,
+      pendingRequests: requests.map((k) => k.replace("request-", "")),
       preparedPlanPath: this.store.getCounter(runId, "prepared-plan-path"),
       planStrategy: this.store.getCounter(runId, "plan-strategy"),
       steps: steps.map((s) => ({ id: s.id, status: s.status, attempts: s.attempts, text: s.text.split("\n")[0] })),
@@ -544,6 +875,12 @@ export class Controller {
       reviews: this.store.getReviews(runId).length,
       checkpoints: this.store.getCheckpoints(runId).length,
     };
+  }
+
+  /** The candidate the final review accepted (null unless COMPLETED). */
+  acceptedCandidate(runId: string): AcceptedCandidate | null {
+    const v = this.store.getCounter(runId, ACCEPTED);
+    return v ? (JSON.parse(v) as AcceptedCandidate) : null;
   }
 
   /**
@@ -589,83 +926,263 @@ export class Controller {
     return { currentSession, recentTransitions };
   }
 
-  // ---------------------------------------------------------------- helpers
+  // ---------------------------------------------------------------- sessions
   /**
-   * Record and launch one agent session, with crash-resume idempotency. If a
-   * prior session with this exact deterministic id already ended and left its
-   * typed artifact on disk (i.e. the process died after the agent finished but
-   * before the controller acted), reuse that artifact instead of recording and
-   * launching a duplicate session.
+   * Crash-resume: an ended session whose outcome was never acted on is
+   * re-processed instead of relaunched. Consumed sessions are never replayed.
    */
-  private async runAgentSession(opts: {
-    runId: string;
-    stepId: string;
-    kind: string;
-    sessionId: string;
-    artifactPath: string;
-    label: PaneLabel;
-    cwd: string;
-    timeoutMs: number;
-    prompt: string;
-  }): Promise<PiLaunchResult> {
-    const prior = this.store.findSessionBySessionId(opts.sessionId);
-    if (prior && prior.ended_at && existsSync(opts.artifactPath)) {
-      try {
-        const artifact = JSON.parse(readFileSync(opts.artifactPath, "utf8")) as TaskArtifact;
-        return {
-          sessionId: opts.sessionId,
-          settled: true,
-          exitCode: 0,
-          timedOut: false,
-          artifact,
-          transcriptPath: `${opts.artifactPath}.transcript.log`,
-        };
-      } catch {
-        // Corrupt/partial artifact \u2014 fall through and relaunch cleanly.
+  private unconsumed(runId: string, kind: string, stepId: string): Obtained | null {
+    const row = this.store.latestSession(runId, kind, stepId);
+    if (!row || row.consumedAt || !row.endedAt) return null;
+    let artifact: TaskArtifact | null = null;
+    try {
+      artifact = validateArtifact(JSON.parse(readFileSync(row.artifactPath, "utf8")));
+    } catch {
+      artifact = null;
+    }
+    this.inflight = row.rowId;
+    const run = this.requireRun(runId);
+    return {
+      row,
+      before: row.gitBefore ?? this.makeGit(run.repoPath).snapshot(run.baseRef),
+      result: {
+        sessionId: row.sessionId,
+        settled: row.exitCode !== null,
+        exitCode: row.exitCode,
+        timedOut: row.timedOut,
+        artifact,
+        transcriptPath: `${row.artifactPath}.transcript.log`,
+      },
+    };
+  }
+
+  /** Record and launch one fresh agent session. */
+  private async launchSession(
+    run: RunRow,
+    git: GitLike,
+    o: { kind: string; stepId: string; sessionId: string; artifactPath: string; label: PaneLabel; prompt: string },
+  ): Promise<Obtained> {
+    const before = git.snapshot(run.baseRef);
+    // Never let a leftover file masquerade as this session's artifact.
+    if (existsSync(o.artifactPath)) renameSync(o.artifactPath, `${o.artifactPath}.stale-${Date.now()}`);
+    const pane = await this.herdr.ensurePane(o.label);
+    const rowId = this.store.recordSession(run.id, o.stepId, o.kind, o.sessionId, pane, o.artifactPath, before);
+    this.inflight = rowId;
+    const result = await this.pi.launch({
+      runId: run.id,
+      stepId: o.stepId,
+      cwd: run.repoPath,
+      sessionId: o.sessionId,
+      artifactPath: o.artifactPath,
+      inactivityTimeoutMs: run.config.sessionInactivityTimeoutMs,
+      prompt: o.prompt,
+      onSpawn: (pid) => this.store.setSessionPid(rowId, pid, hostname()),
+    });
+    const artifact = validateArtifact(result.artifact);
+    const stopped = this.store.getCounter(run.id, STOP_REQUEST) !== null;
+    const status = stopped ? "stopped" : artifact?.status ?? (result.settled ? "unknown" : "aborted");
+    this.store.endSession(rowId, status, result.settled ? result.exitCode ?? 0 : null, result.timedOut);
+    if (stopped) this.haltForStop(run.id, rowId);
+    return { result: { ...result, artifact }, row: this.store.getSession(rowId)!, before };
+  }
+
+  /**
+   * Restart reconciliation (Section 9). A session the previous controller
+   * never saw end is either still running — then we refuse to start another
+   * writer and enter reconciliation — or provably gone: its partial work is
+   * preserved as evidence and left in place, the session is retired, and the
+   * phase continues with a fresh, informed attempt.
+   */
+  private async reconcileInflight(runId: string): Promise<void> {
+    const open = this.store.openSessions(runId);
+    if (open.length === 0) return;
+    for (const s of open) {
+      const deadline = Date.now() + this.orphanGraceMs;
+      while ((await this.pi.isRunning(ref(s))) && Date.now() < deadline) await sleep(250);
+      if (await this.pi.isRunning(ref(s))) {
+        const msg =
+          `Session ${s.sessionId} (pid ${s.pid} on ${s.host}) from an earlier controller is still running; ` +
+          `refusing to start a second writer. Let it finish (or 'qfb stop ${runId}'), then 'qfb resume ${runId}'.`;
+        this.stopRun(runId, State.RECONCILIATION, msg);
+        throw new HaltSignal(msg);
       }
     }
-    const pane = await this.herdr.ensurePane(opts.label);
-    const sessionRow = this.store.recordSession(opts.runId, opts.stepId, opts.kind, opts.sessionId, pane, opts.artifactPath);
-    const result = await this.pi.launch({
-      runId: opts.runId,
-      stepId: opts.stepId,
-      cwd: opts.cwd,
-      sessionId: opts.sessionId,
-      artifactPath: opts.artifactPath,
-      inactivityTimeoutMs: opts.timeoutMs,
-      prompt: opts.prompt,
+    const run = this.requireRun(runId);
+    const git = this.makeGit(run.repoPath);
+    const evidence = open.map((s) => this.preserveInterrupted(run, git, s));
+    this.store.tx(() => {
+      for (const s of open) this.retireSession(s.rowId, "interrupted");
+      if (isActive(run.state)) {
+        this.transition(runId, run.state, State.RECONCILIATION, "interrupted-session",
+          JSON.stringify({ sessions: open.map((s) => s.sessionId), evidence }));
+        this.transition(runId, State.RECONCILIATION, resumeTarget(run.state), "auto-reconciled",
+          "in-flight session(s) no longer running; partial changes preserved and left in the working tree");
+      }
     });
-    this.store.endSession(sessionRow, result.artifact?.status ?? "unknown");
-    return result;
+  }
+
+  /** Persist a forced stop observed by the live controller, then unwind. */
+  private haltForStop(runId: string, rowId: number | null): never {
+    const run = this.requireRun(runId);
+    const s = rowId !== null ? this.store.getSession(rowId) : null;
+    const evidence = s ? this.preserveInterrupted(run, this.makeGit(run.repoPath), s) : null;
+    this.store.tx(() => {
+      if (s) this.store.consumeSession(s.rowId);
+      this.inflight = null;
+      this.store.deleteCounter(runId, STOP_REQUEST);
+      this.stopRun(runId, State.RECONCILIATION,
+        `Operator forced stop${s ? ` during session ${s.sessionId}; partial changes preserved at ${evidence}` : ""}. ` +
+          `Inspect the checkout, then 'qfb resume ${runId}'.`);
+    });
+    throw new HaltSignal("stopped");
+  }
+
+  /** Re-open blocked/failed steps so the loop retries them instead of skipping ahead. */
+  private reopenSteps(runId: string): void {
+    for (const s of this.store.getSteps(runId)) {
+      if (s.status === "blocked" || s.status === "failed") this.store.setStepStatus(runId, s.id, "pending");
+    }
+  }
+
+  private retireSession(rowId: number, status: string): void {
+    const s = this.store.getSession(rowId);
+    if (s && !s.endedAt) this.store.endSession(rowId, status, null, false);
+    this.store.consumeSession(rowId);
+  }
+
+  /** Save the working-tree state an interrupted session left behind. Never modifies the checkout. */
+  private preserveInterrupted(run: RunRow, git: GitLike, s: SessionRow): string {
+    const path = `${s.artifactPath}.interrupted.patch`;
+    const files = safe(() => git.changedFiles(run.baseRef).join("\n"), "(unavailable)");
+    const diff = safe(() => git.workingDiff(run.baseRef), "(unavailable)");
+    writeFileSync(path, `# session ${s.sessionId} interrupted\n# changed vs ${run.baseRef}:\n${files}\n\n${diff}\n`);
+    return path;
+  }
+
+  // ---------------------------------------------------------------- tests
+  /** Re-run each claimed validation command, one at a time, capturing the REAL exit code. */
+  private async verifyTests(run: RunRow, a: TaskArtifact, row: SessionRow): Promise<VerifiedTest[]> {
+    const out: VerifiedTest[] = [];
+    for (let i = 0; i < a.testCommands.length; i++) {
+      const t = a.testCommands[i]!;
+      const logPath = `${row.artifactPath}.verify-${i + 1}.log`;
+      const exitCode = await this.runTest(t.command, run.repoPath, logPath, run.config.testTimeoutMs);
+      out.push({ command: t.command, claimedExitCode: t.exitCode, exitCode, logPath });
+    }
+    return out;
+  }
+
+  private suitePath(runId: string): string {
+    return this.artifactPath(runId, "regression-suite.json");
+  }
+
+  /** Accumulate every verified command; all must pass on the final candidate. */
+  private rememberTests(runId: string, verified: VerifiedTest[]): void {
+    const suite = this.readSuite(runId);
+    for (const t of verified) if (!suite.includes(t.command)) suite.push(t.command);
+    writeFileSync(this.suitePath(runId), JSON.stringify(suite, null, 2) + "\n");
+  }
+
+  private readSuite(runId: string): string[] {
+    try {
+      const v = JSON.parse(readFileSync(this.suitePath(runId), "utf8"));
+      return Array.isArray(v) ? v.filter((c): c is string => typeof c === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private async runRegressionSuite(run: RunRow, row: SessionRow): Promise<VerifiedTest[]> {
+    const out: VerifiedTest[] = [];
+    const suite = this.readSuite(run.id);
+    for (let i = 0; i < suite.length; i++) {
+      const logPath = `${row.artifactPath}.final-${i + 1}.log`;
+      const exitCode = await this.runTest(suite[i]!, run.repoPath, logPath, run.config.testTimeoutMs);
+      out.push({ command: suite[i]!, claimedExitCode: 0, exitCode, logPath });
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------- helpers
+  /** Commit-policy checkpoint of the gated tree; returns the checkpoint HEAD. */
+  private checkpointCommit(run: RunRow, git: GitLike, label: string, summary: string): string {
+    if (run.config.checkpointPolicy !== "commit") return git.head();
+    let msg = `[qfb] ${label}: ${summary.split("\n")[0] ?? ""}`.slice(0, 72).trim();
+    // Commit messages leave the machine with a push: keep deny-listed names out.
+    if (scanForDenyTerms(msg, run.denyList).length > 0) msg = `[qfb] ${label} checkpoint`;
+    return git.commitAll(msg);
+  }
+
+  private sessionsSinceEpoch(runId: string, f: { kind?: string; stepId?: string } = {}): number {
+    return this.store.countSessions(runId, { ...f, sinceRowId: this.store.getNumber(runId, BUDGET_EPOCH) });
+  }
+
+  /** The phase to return to: derived from the last transition out of an active state. */
+  private resumeStateOf(runId: string): StateName {
+    const ts = this.store.getTransitions(runId);
+    for (let i = ts.length - 1; i >= 0; i--) {
+      const from = ts[i]!.from_state as StateName | null;
+      const to = ts[i]!.to_state as StateName;
+      if (from && isActive(from) && isOrthogonal(to)) return resumeTarget(from);
+    }
+    return State.READY;
   }
 
   private stopRun(runId: string, state: StateName, reason: string): StateName {
-    const run = this.requireRun(runId);
-    this.store.setStopReason(runId, reason);
-    if (run.state !== state) this.transition(runId, run.state, state, "stop", reason);
+    this.store.tx(() => {
+      const run = this.requireRun(runId);
+      this.store.setStopReason(runId, reason);
+      if (state === State.PAUSED) this.store.deleteCounter(runId, PAUSE_REQUEST);
+      if (run.state !== state) this.transition(runId, run.state, state, "stop", reason);
+      if (this.inflight !== null) {
+        this.store.consumeSession(this.inflight);
+        this.inflight = null;
+      }
+    });
     return state;
   }
 
-  private checkDesignIntegrity(runId: string): void {
+  private designChanged(runId: string): boolean {
     const run = this.requireRun(runId);
-    if (!existsSync(run.designPath)) return;
-    const current = sha256(readFileSync(run.designPath, "utf8"));
-    if (current !== run.designHash) {
-      if (run.state !== State.PAUSED) {
-        this.transition(runId, run.state, State.PAUSED, "design-changed");
+    if (!existsSync(run.designPath)) return false;
+    return sha256(readFileSync(run.designPath, "utf8")) !== run.designHash;
+  }
+
+  /**
+   * Validated, compare-and-set state change. Fails loudly if the persisted
+   * state is not `from` (another actor changed it), instead of overwriting it.
+   * Consumes the in-flight session outcome in the same transaction.
+   */
+  private transition(runId: string, from: StateName, to: StateName, op: string, evidence?: string): void {
+    assertTransition(from, to);
+    this.store.tx(() => {
+      if (!this.store.casState(runId, from, to)) {
+        const cur = this.store.getRun(runId)?.state;
+        throw new Error(`State conflict on ${runId}: expected ${from}, found ${cur}; refusing ${from} -> ${to}.`);
       }
-      this.store.setStopReason(runId, "Approved design changed after approval; re-approval required.");
-      throw new PauseSignal("Approved design document changed; run paused pending re-approval.");
+      if (this.inflight !== null) {
+        this.store.consumeSession(this.inflight);
+        this.inflight = null;
+      }
+      this.store.recordTransition(runId, from, to, op, evidence);
+    });
+  }
+
+  private withRunLock<T>(runId: string, fn: () => T): T {
+    if (!this.store.acquireLock(runId)) throw new Error(this.lockedMessage(runId));
+    try {
+      return fn();
+    } finally {
+      this.store.releaseLock(runId);
     }
   }
 
-  private transition(runId: string, from: StateName, to: StateName, op: string, evidence?: string): void {
-    assertTransition(from, to);
-    this.store.setState(runId, to);
-    this.store.recordTransition(runId, from, to, op, evidence);
+  private lockedMessage(runId: string): string {
+    const h = this.store.lockHolder(runId);
+    return `Run ${runId} is locked by another controller instance${h ? ` (pid ${h.pid} on ${h.host})` : ""}.`;
   }
 
-  private requireRun(runId: string) {
+  private requireRun(runId: string): RunRow {
     const run = this.store.getRun(runId);
     if (!run) throw new Error(`Unknown run ${runId}`);
     return run;
@@ -681,38 +1198,86 @@ export class Controller {
     return join(this.artifactDir(runId), name);
   }
 
-  private buildStepPrompt(designPath: string, step: { id: string; text: string }, done: string[], artifactPath: string): string {
+  private priorFailures(runId: string, key: string): string[] {
+    const v = this.store.getCounter(runId, key);
+    return v ? (JSON.parse(v) as string[]) : [];
+  }
+
+  private static readonly COMMON_RULES = [
+    `- Do NOT stage, commit, reset, rebase, or switch branches; QFB owns checkpoints and verifies HEAD is unchanged.`,
+    `- Never run concurrent Maven invocations. Treat java-questdb-client/ as a separate repo.`,
+    `- List EVERY validation command you ran in testCommands, as the exact command line run from the repository root.`,
+    `  QFB re-runs each one itself and gates on the REAL exit code; a claimed exit code that differs rejects the result.`,
+  ];
+
+  private buildStepPrompt(
+    run: RunRow,
+    step: { id: string; text: string },
+    done: string[],
+    artifactPath: string,
+    attempt: number,
+  ): string {
+    const prior = this.priorFailures(run.id, `gate-failures:${step.id}`);
     return [
       `You are implementing ONE step of an approved QuestDB feature plan.`,
-      `First read CLAUDE.md and the approved design at: ${designPath}`,
+      `First read CLAUDE.md and the approved design at: ${run.designPath}`,
       `Completed steps: ${done.length ? done.join(", ") : "(none)"}`,
       ``,
       `## Assigned step ${step.id}`,
       step.text,
       ``,
+      ...(attempt > 1
+        ? [
+            `This is attempt ${attempt}. The working tree may contain partial changes from an earlier, interrupted or`,
+            `rejected attempt of this step: inspect \`git status\` / \`git diff\` and build on them; do not discard them.`,
+            ...(prior.length ? [`The previous attempt was rejected by QFB's mechanical gate: ${prior.join("; ")}`] : []),
+            ``,
+          ]
+        : []),
       `Rules:`,
       `- Implement ONLY this step and its tests. Do NOT start another step.`,
       `- Do NOT change the architecture, requirements, or other plan steps.`,
-      `- Never run concurrent Maven invocations. Treat java-questdb-client/ as a separate repo.`,
+      ...Controller.COMMON_RULES,
       `- When done, write a typed JSON TaskArtifact to: ${artifactPath}`,
       `  with fields: {runId, stepId, kind:"implementation", status, summary, changedFiles[],`,
-      `  testCommands[{command,exitCode,logPath}], limitations[], notableDecisions[], createdAt}.`,
+      `  testCommands[{command,exitCode}], limitations[], notableDecisions[], createdAt}.`,
       `- status MUST be one of DONE | BLOCKED | NEEDS_DECISION | FAILED.`,
     ].join("\n");
   }
 
-  private buildHardeningPrompt(designPath: string, stage: StateName, artifactPath: string): string {
+  private buildHardeningPrompt(run: RunRow, stage: StateName, artifactPath: string, failuresKey: string): string {
+    const gaps = this.store.getCounter(run.id, "hardening-gap-artifact");
+    const bugDoc = this.store.getCounter(run.id, "hardening-bug-artifact");
+    const openBugs = this.store.getCounter(run.id, "open-bugs") ?? "[]";
+    const prior = this.priorFailures(run.id, failuresKey);
     const what =
       stage === State.HARDENING_IDENTIFY
-        ? "Analyze the cumulative feature diff and existing tests; write a prioritized coverage-gap handoff (fuzz, concurrency, edge cases, integration, fault injection). Do NOT modify code or tests."
+        ? [
+            `Analyze the cumulative feature diff (vs ${run.baseRef}) and the existing tests; write a prioritized coverage-gap`,
+            `handoff (fuzz, concurrency, edge cases, integration, fault injection) to ${artifactPath}.gaps.md and set handoffPath.`,
+            `This stage is READ-ONLY: do NOT modify any file in the checkout (QFB verifies the tree is unchanged).`,
+          ]
         : stage === State.HARDENING_WRITE_TESTS
-        ? "Implement the tests from the coverage-gap handoff. If a test exposes a real bug, record it in the bug handoff (stable id, repro, failing test, observed vs expected) — do NOT weaken or delete the test."
-        : "Fix each confirmed bug (the defect, not the test). Validate the previously failing test now passes without regressions.";
+        ? [
+            `Implement the tests described in the coverage-gap handoff at ${gaps} (and its handoffPath document).`,
+            `If a test exposes a real bug, record it in bugs[] (stable id, location, repro, failingTest, observed, expected)`,
+            `and keep the failing test — do NOT weaken or delete it. A failing test command is only accepted when the bug it`,
+            `exposes is recorded. Put a detailed bug handoff in ${artifactPath}.bugs.md and set handoffPath.`,
+          ]
+        : [
+            `Fix the defects (not the tests) for these open bugs, recorded in ${bugDoc}:`,
+            openBugs,
+            `Validate that the previously failing tests now pass without regressions. In bugs[], list ONLY the bugs that are`,
+            `still open after your work (an empty array when all are fixed). Set fixOutcome: Clean | Blocked | Diverging | Exhausted.`,
+          ];
     return [
       `Phase C test-coverage hardening stage: ${stage}.`,
-      `Read CLAUDE.md and the approved design at: ${designPath}`,
-      what,
-      `Write a typed JSON TaskArtifact to ${artifactPath} (include a bugs[] array for write/fix stages).`,
+      `Read CLAUDE.md and the approved design at: ${run.designPath}`,
+      ...what,
+      ...(prior.length ? [`The previous attempt was rejected by QFB's mechanical gate: ${prior.join("; ")}`] : []),
+      `Rules:`,
+      ...Controller.COMMON_RULES,
+      `Write a typed JSON TaskArtifact to ${artifactPath} with status DONE | BLOCKED | NEEDS_DECISION | FAILED.`,
     ].join("\n");
   }
 
@@ -720,10 +1285,11 @@ export class Controller {
     return [
       `Run QuestDB's review-pr skill on the cumulative feature diff.`,
       `Invoke: /skill:review-pr --range=${base}.. --level=${level}`,
-      `Preserve the COMPLETE raw report to a file and set reviewReportPath to it.`,
+      `This session is READ-ONLY: do NOT modify any file in the checkout (QFB verifies the tree is unchanged).`,
+      `Write the COMPLETE raw report to ${artifactPath}.report.md and set reviewReportPath to that path.`,
       `The report MUST contain a machine-readable fenced \`\`\`qfb-review JSON block with`,
       `{verdict, testGatePassed, findings:[{id,severity,location,evidence}]}.`,
-      `Write a typed JSON TaskArtifact (kind:"review") to ${artifactPath}.`,
+      `Write a typed JSON TaskArtifact (kind:"review", status DONE) to ${artifactPath}.`,
     ].join("\n");
   }
 
@@ -731,12 +1297,31 @@ export class Controller {
     return [
       `Run QuestDB's fix-pr skill against these authorized findings:`,
       JSON.stringify(findings, null, 2),
-      `Preserve finding IDs, severities, context, and evidence. Do not stage/commit/push.`,
+      `Preserve finding IDs, severities, context, and evidence.`,
+      `Rules:`,
+      ...Controller.COMMON_RULES,
       `Report the skill's distinct outcome in fixOutcome: Clean | Blocked | Diverging | Exhausted.`,
-      `Write a typed JSON TaskArtifact (kind:"fix") to ${artifactPath}.`,
+      `Write a typed JSON TaskArtifact (kind:"fix", status DONE unless blocked) to ${artifactPath}.`,
     ].join("\n");
   }
 }
+
+function ref(s: SessionRow): SessionRef {
+  return { sessionId: s.sessionId, pid: s.pid, host: s.host };
+}
+
+/** Lock key for a checkout, so two runs can never write the same tree. */
+function repoLockKey(repoPath: string): string {
+  let p: string;
+  try {
+    p = realpathSync(repoPath);
+  } catch {
+    p = resolve(repoPath);
+  }
+  return `repo:${p}`;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function sha256(s: string): string {
   return createHash("sha256").update(s).digest("hex");

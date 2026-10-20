@@ -5,7 +5,7 @@ import { Store } from "../src/store.ts";
 import { Controller } from "../src/controller.ts";
 import { NullHerdrAdapter } from "../src/adapters/herdr.ts";
 import type { GitLike } from "../src/controller.ts";
-import type { PiAdapter, PiLaunchRequest, PiLaunchResult } from "../src/adapters/pi.ts";
+import type { PiAdapter, PiLaunchRequest, PiLaunchResult, SessionRef } from "../src/adapters/pi.ts";
 import type { GitSnapshot, TaskArtifact } from "../src/types.ts";
 
 /** Mutable fake Git whose snapshot() reflects the current shared state. */
@@ -17,7 +17,10 @@ export class FakeGit implements GitLike {
     submoduleHead: "sub0" as string | null,
     changedFiles: [] as string[],
     diffText: "",
+    /** Test names that currently fail for real (e.g. tests exposing an open bug). */
+    failing: [] as string[],
   };
+  commits: string[] = [];
   branch() {
     return this.state.branch;
   }
@@ -42,10 +45,29 @@ export class FakeGit implements GitLike {
   isClean() {
     return this.state.fingerprint === "fp0";
   }
-  commitCheckpoint(_m: string, _f: string[]) {
-    this.state.head = "commit-" + Math.random().toString(16).slice(2, 8);
+  commitAll(message: string) {
+    this.commits.push(message);
+    this.state.head = "commit-" + this.commits.length;
     return this.state.head;
   }
+}
+
+/**
+ * Scripted validation-command runner: the REAL exit code per command. By
+ * default a command fails iff it names a test in `git.state.failing`.
+ */
+export class FakeTests {
+  ran: string[] = [];
+  exitFor: (command: string) => number;
+  constructor(git: FakeGit) {
+    this.exitFor = (c) => (git.state.failing.some((t) => c.includes(`-Dtest=${t} `)) ? 1 : 0);
+  }
+  run = async (command: string, _cwd: string, logPath: string): Promise<number> => {
+    this.ran.push(command);
+    const code = this.exitFor(command);
+    writeFileSync(logPath, `$ ${command}\nexit ${code}\n`);
+    return code;
+  };
 }
 
 export type PiHandler = (req: PiLaunchRequest, git: FakeGit) => Partial<PiLaunchResult> & { settled?: boolean };
@@ -54,9 +76,13 @@ export type PiHandler = (req: PiLaunchRequest, git: FakeGit) => Partial<PiLaunch
  * Scripted mock Pi adapter. Each launch consumes the next handler from the
  * queue (or a default). Handlers may mutate the shared FakeGit to simulate
  * code changes, and return the artifact/launch result the controller sees.
+ * Like real Pi, the artifact is also written to the requested path on disk.
  */
 export class MockPi implements PiAdapter {
   launches: PiLaunchRequest[] = [];
+  terminated: string[] = [];
+  /** Sessions that outlived their controller (simulated orphans). */
+  orphans = new Set<string>();
   private queue: PiHandler[] = [];
   private running = new Set<string>();
   private git: FakeGit;
@@ -70,6 +96,7 @@ export class MockPi implements PiAdapter {
   async launch(req: PiLaunchRequest): Promise<PiLaunchResult> {
     this.launches.push(req);
     this.running.add(req.sessionId);
+    req.onSpawn?.(40000 + this.launches.length);
     const h = this.queue.shift();
     const base: PiLaunchResult = {
       sessionId: req.sessionId,
@@ -80,11 +107,16 @@ export class MockPi implements PiAdapter {
       transcriptPath: null,
     };
     const result = h ? { ...base, ...h(req, this.git) } : base;
+    if (result.artifact) writeFileSync(req.artifactPath, JSON.stringify(result.artifact));
     this.running.delete(req.sessionId);
     return result;
   }
-  async isRunning(id: string) {
-    return this.running.has(id);
+  async isRunning(ref: SessionRef) {
+    return this.running.has(ref.sessionId) || this.orphans.has(ref.sessionId);
+  }
+  async terminate(ref: SessionRef) {
+    this.terminated.push(ref.sessionId);
+    this.orphans.delete(ref.sessionId);
   }
 }
 
@@ -110,24 +142,33 @@ export interface Harness {
   controller: Controller;
   git: FakeGit;
   pi: MockPi;
+  tests: FakeTests;
   designPath: string;
+  /** A second controller on the same DB, as another `qfb` process would be. */
+  other(): Controller;
 }
 
 export function makeHarness(design: string, handlers: PiHandler[] = []): Harness {
   const dir = mkdtempSync(join(tmpdir(), "qfb-test-"));
   const designPath = join(dir, "design.md");
   writeFileSync(designPath, design);
-  const store = new Store(join(dir, "state.sqlite"));
+  const dbPath = join(dir, "state.sqlite");
+  const store = new Store(dbPath);
   const git = new FakeGit();
   const pi = new MockPi(git, handlers);
-  const controller = new Controller({
-    store,
-    pi,
-    herdr: new NullHerdrAdapter(),
-    makeGit: () => git,
-    artifactRoot: join(dir, "artifacts"),
-  });
-  return { dir, store, controller, git, pi, designPath };
+  const tests = new FakeTests(git);
+  const make = (s: Store) =>
+    new Controller({
+      store: s,
+      pi,
+      herdr: new NullHerdrAdapter(),
+      makeGit: () => git,
+      artifactRoot: join(dir, "artifacts"),
+      runTest: tests.run,
+      orphanGraceMs: 0,
+    });
+  const controller = make(store);
+  return { dir, store, controller, git, pi, tests, designPath, other: () => make(new Store(dbPath)) };
 }
 
 export const THREE_STEP_DESIGN = `# Feature

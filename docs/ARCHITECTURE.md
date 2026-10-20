@@ -30,11 +30,12 @@ Node process; there is no server, broker, or scheduler.
 
 | File | Responsibility |
 |------|----------------|
-| `src/controller.ts` | The durable controller. Owns the lifecycle, runs `advance()` as a pure function of persisted state, performs mechanical gating, checkpoints, drives the hardening and review/fix loops, and handles pause/resume/stop/recovery. |
-| `src/stateMachine.ts` | The validated transition table. Invalid transitions throw. Orthogonal states (`paused`/`blocked`/`failed`/`reconciliation`) are reachable from any active state with explicit exits. |
-| `src/store.ts` | `node:sqlite` transactional store: runs, steps, transitions, sessions, checkpoints, reviews, counters, and an **exclusive run lock** (pid+host, stale-takeover). |
+| `src/controller.ts` | The durable controller. Owns the lifecycle, runs `advance()` as a pure function of persisted state, gates every session, re-runs claimed validation commands, checkpoints, drives the hardening and review/fix loops, and handles pause/resume/stop/reconciliation. |
+| `src/stateMachine.ts` | The validated transition table. Invalid transitions throw. Orthogonal states (`paused`/`blocked`/`failed`/`reconciliation`) are reachable from any non-terminal state and exit back to the interrupted phase (`resumeTarget`). |
+| `src/store.ts` | `node:sqlite` transactional store: runs, steps, transitions, sessions (pid, outcome, consumption), checkpoints, reviews, counters, and atomic **exclusive locks** on the run and its checkout (pid+host, stale-takeover). |
+| `src/procs.ts` | Process groups: every Pi session and re-run test command leads its own group, so a timeout/stop kills the whole tree and strays are reaped on exit (no overlapping writers, no concurrent Maven). Also the default `sh -c` test runner. |
 | `src/plan.ts` | The preparation phase's normalizer. Extracts an ordered plan from a Markdown design/handoff doc via three strategies in priority order: `### Step N` heading-delimited steps, numbered lists, then checkboxes. Emits QFB's canonical manifest. Preserves wording; never invents or reorders; flags ambiguity for approval. |
-| `src/gating.ts` | Mechanical gate (Section 6.1): objective facts only — artifact presence/typing, test exit codes, branch/submodule identity, scope, confidentiality, orchestration-artifact hygiene. |
+| `src/gating.ts` | Mechanical gate (Section 6.1): objective facts only — artifact validity, the controller's REAL test exit codes vs the claims, branch/HEAD/submodule identity, scope, confidentiality, orchestration-artifact hygiene. `writer` mode for code-changing sessions, `read-only` mode (tree must be unchanged) for identify/review. |
 | `src/confidentiality.ts` | Frozen deny-list matching with token variants (snake/kebab/camel/nospace), case-insensitive. A mechanical gate, never an inference. |
 | `src/report.ts` | Parses `review-pr`'s machine-readable ```qfb-review``` surface; **pauses on ambiguity** instead of guessing. Selects actionable findings by policy; computes acceptance. |
 | `src/identity.ts` | One shared identity + no-progress mechanism, instantiated over review findings and hardening bug entries. |
@@ -55,11 +56,22 @@ observation, never proof.
 ## Determinism & recovery
 
 `advance()` chooses the next action purely from persisted state, so a crash between any two steps is
-recoverable: on restart the controller re-acquires the run lock, re-reads state, inspects Git and
-existing sessions, and resumes only from a verified point. Stable operation IDs
-(`run-…-S1-a1`, `run-…-review-2`, …) make retried actions idempotent — a retried controller cannot
-create a duplicate logical step or a second writer. Retry budgets and no-progress history live in the
-store and are **not** reset on restart.
+recoverable:
+
+- **Exactly-once outcomes.** Each session row is *consumed* in the same transaction as the state
+  transition that acts on its outcome. A crash before that point re-processes the outcome from the
+  on-disk artifact (never relaunching the agent); after it, the outcome is never replayed — a
+  resumed or retried phase always gets a fresh session id (`run-…-S1-a2`, `run-…-review-3`, …).
+- **One writer.** Sessions record their pid (= process group). On restart, a session the previous
+  controller never saw end is checked: alive → `reconciliation`, no second writer; gone → its
+  partial work is preserved as evidence and the phase continues with an informed attempt. Locks
+  cover both the run and the checkout.
+- **Compare-and-set transitions.** Every state change is `UPDATE … WHERE state = <expected>`; a
+  concurrent change is refused, never overwritten. `pause`/`stop` from another process are
+  *requests* the live controller honors (pause between sessions; stop kills the session tree).
+- **Budgets persist.** Attempt/iteration/session budgets count session rows, so restarts never reset
+  them. Only an explicit operator retry of a `failed` run (`qfb resume`) opens a fresh, audited
+  budget window.
 
 ## Why these technology choices
 
