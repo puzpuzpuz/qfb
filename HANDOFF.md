@@ -1,17 +1,20 @@
 # QFB review handoff — open High and Medium items
 
-**Baseline:** `5063210` ("Fix critical gating, recovery, and push-safety bugs in the controller").
-All critical review items are fixed in that commit; this document hands over what remains.
-Verify the baseline with `npm run typecheck && npm test` (80 tests, all passing).
+**Baseline:** `d957ca9` ("Close fail-open gaps in gating, plan approval, and PR push").
+All critical items were fixed in `5063210`; `d957ca9` fixed H1, H2, H3, H6, M3, F2, F7, F8 and F9.
+This document hands over what remains. Verify the baseline with `npm run typecheck && npm test`
+(107 tests, all passing).
 
 Each item lists the problem, where it lives, a suggested fix, and a "done when" check. Locations
 are given as file + function (line numbers drift). Suggested order is at the end.
 
-## Already resolved by `5063210` (do not redo)
+## Already resolved (do not redo)
+
+### By `5063210`
 
 | Original item | Status |
 |---|---|
-| High: deny-list not applied to commit messages / PR text | Applied now (`Controller.checkpointCommit`, `openPrIfNone`), but with the weak matcher, see H1 |
+| High: deny-list not applied to commit messages / PR text | Fixed (`Controller.checkpointCommit`, `openPrIfNone`); the matcher itself was fixed by H1 |
 | High: HEAD changes / history rewrites not gated | Fixed: the gate pauses on HEAD, branch, or submodule movement |
 | High: commit mode staged the agent's self-reported files | Fixed: `Git.commitAll` commits the gated tree; commit mode requires a clean checkout |
 | High: malformed artifact crashed the controller; stale artifact at the path | Fixed: `validateArtifact`; leftover files are renamed before launch |
@@ -21,89 +24,23 @@ are given as file + function (line numbers drift). Suggested order is at the end
 | Medium: docs contradicted `build` (push / PR) | Fixed |
 | Medium: `MockPi` never wrote artifacts; no Diverging/Exhausted tests | Fixed |
 
+### By `d957ca9`
+
+| Item | How it was fixed |
+|---|---|
+| H1. Deny-list misses realistic leaks | `foldForMatch` folds both sides to lowercase letters and digits and substring-matches (`src/confidentiality.ts`). The gate scans `Git.addedContent`: added lines, new/untracked file contents, and non-deleted paths. Removed and context lines are never scanned. Binary, oversized (> 64 MiB) and unreadable files fail closed and are named. `qfb resume --accept-unscannable` vets them, bound to each file's content digest (`unscannable-*` counters). A final scan of the reviewed candidate runs before `COMPLETED`. |
+| H2. Large diffs wedge the run; git errors fail open | `Git` uses a 1 GiB `maxBuffer` and config-independent diff flags, and has no fallbacks. Failures throw `GitError`. `Controller.run` turns that into a pause and keeps the session outcome for re-gating on resume (`holdOutcome`). The `safe(...)` substitutions are gone (`writerEvidence`). |
+| H3. Plan extraction loses or invents steps; approval doesn't re-check | Fence-aware extractor that keeps full step bodies; several lists, numbering restarts and mixed list kinds are flagged ambiguous. The source hash is stored (`plan-source-hash`, also in the manifest header). `approve` refuses 0 steps and re-extracts a changed design (`replan`): unchanged steps keep their progress, new or edited steps get fresh ids, and a changed plan needs a second `approve` (`PlanChangedError`). `build --yes` doesn't cover an ambiguous plan or a re-approval. |
+| H6. Artifact identity not checked | `checkArtifact` compares `runId`, `stepId`, `kind` (per `ARTIFACT_KIND`), and `createdAt` (5 s slack) against the session. Prompts state the exact values. The rejection reason reaches the gate failure. |
+| M3. Lenient review-report parsing | Exactly one `qfb-review` block; duplicate finding ids are ambiguous. (The report *surface* is still an M6 decision.) |
+| F2. Base ref not resolved to a SHA | `init` stores `baseRef` = SHA and `baseSpec` = the ref as given; `findRun` matches either. A ref that doesn't resolve is refused. |
+| F7. `approve()` worked on any paused run | Only `AWAITING_APPROVAL`, or `paused` with the design-change reason. Re-approval consumes held outcomes, and goes to `IMPLEMENTING` when the new plan has unfinished steps. |
+| F8. An already-open PR went stale | `openPrIfNone` pushes the accepted commit first, then reuses or opens the PR. |
+| F9. CLI/config validation | `--level` must be `0`–`3`; `validateConfig` rejects unknown keys and out-of-range values; deny terms with no letters or digits are refused, and very short ones get a warning. |
+
 ---
 
 ## High
-
-### H1. Confidentiality deny-list misses realistic leaks
-
-- **Problem.** `scanForDenyTerms` matches ``\b<variant>\b`` on lowercased text. `_` is a word character,
-  and lowercasing erases camel-case boundaries. So none of these match:
-  - `acmecorp_trades` or `test_trade_events_wal`: the term is embedded in a snake_case identifier.
-  - `AcmeCorpIngestTest` or `testTradeEventsOoo`: the term is embedded in a camel/Pascal-case identifier.
-  - `acme_corp` for the deny-term `AcmeCorp`: single-word terms get no variants.
-
-  The camelCase variant can never match, because it contains uppercase letters while the haystack
-  is lowercased. Input gaps:
-  - `Git.workingDiff` skips untracked files over 512 KiB and binary files. Both fail open.
-  - The scan covers removed (`-`) and context lines, so pre-existing occurrences cause false-positive pauses.
-
-  The same matcher now guards commit messages and PR text.
-- **Where.** `src/confidentiality.ts` (`tokenVariants`, `scanForDenyTerms`), `src/git.ts` (`workingDiff`).
-- **Fix.**
-  - Normalize both sides to lowercase alphanumerics only, and substring-match the normalized term.
-    The deny-list is explicit, so accept the extra false positives.
-  - Scan only added lines plus new or untracked file contents.
-  - If something can't be scanned (too large, binary, or unreadable), fail closed: pause and name the file.
-- **Done when.** All seven of these are caught: `class AcmeCorpIngestTest`, `"acmecorp_trades"`,
-  `acme_corp_trades`, `test_trade_events_wal`, `testTradeEventsOoo`, `trade-events`, `TRADE_EVENTS`.
-  A deleted line containing a term does not pause.
-
-### H2. Large diffs wedge the run; git errors fail open
-
-- **Problem.** `Git.run` uses `execFileSync` with the default 1 MiB `maxBuffer`.
-  - Once the cumulative `git diff <base>` exceeds 1 MiB, `snapshot()` throws ENOBUFS and every step
-    aborts, so the run is wedged.
-  - `workingDiff` swallows the error and returns `""`, so the deny-list scan passes (fails open).
-  - The controller makes it worse:
-    - `safe(() => git.changedFiles(...), a?.changedFiles ?? [])` falls back to the agent's self-report.
-    - `safe(() => git.workingDiff(...), "")` falls back to an empty diff.
-  - On *any* error, `dirtyFingerprint`, `changedFiles` and `workingDiff` silently fall back from
-    `git diff <base>` to `git diff` (working tree vs index), which is a different comparison. A
-    missing base ref does this, for example.
-- **Where.** `src/git.ts` (`run`, `dirtyFingerprint`, `changedFiles`, `workingDiff`);
-  `src/controller.ts` (gate inputs in `doImplementationStep`, `doHardening`, `doFix`).
-- **Fix.**
-  - Raise `maxBuffer` to 1 GiB, or stream the diff into the hash.
-  - Remove the silent fallbacks.
-  - Any git failure while building gate inputs must fail the gate closed (pause, with the error).
-    It must never substitute agent claims or an empty string.
-- **Done when.** A 5 MiB feature diff completes a step, and a deny term inside it is still caught.
-  A missing base ref pauses with a clear message.
-
-### H3. Plan extraction silently loses or invents steps; approval doesn't re-check the plan
-
-- **Problem.**
-  - **Code fences.** A `# comment` inside a fenced code block (common in bash snippets) is parsed
-    as a heading. It ends the plan region or step early, so later steps vanish. A 3-step plan came
-    out as 1 step, with no ambiguity flag.
-  - **List bodies.** The ordered-list strategy keeps only an item's first line. Indented prose and
-    code under an item are dropped, despite the "wording preserved verbatim" claim.
-  - **Stray lists.** Any top-level numbered list in the plan region becomes steps, such as an
-    "Acceptance criteria" list. Numbering restarts aren't flagged, and checkbox and numbered lists
-    get merged.
-  - **Ambiguity.** `ambiguous` is set only when zero steps were found.
-  - **Zero-step plans.** `build` refuses an ambiguous plan only when creating the run. Re-running
-    `build --yes` finds the same run and approves it. `approve()` doesn't check the step count, so
-    the run goes straight to hardening and review, and can complete with no implementation.
-  - **Edited designs.** `approve()` re-hashes the *current* design but never re-extracts its
-    steps, so editing the design and re-approving freezes the new hash with the old plan. Following
-    `build`'s own advice ("edit the design doc and re-run") gives exactly that result.
-  - **Auto re-approval.** `build --yes` re-approves a changed design automatically:
-    `needsApproval` includes paused runs awaiting re-approval.
-- **Where.** `src/plan.ts` (`extractPlan`, `extractHeadingSteps`, `extractListItems`);
-  `Controller.approve`; `cmdBuild` in `src/index.ts`.
-- **Fix.**
-  - Use a fence-aware line scanner.
-  - Keep each item's full body.
-  - Flag ambiguity when there are several lists, numbering restarts, or mixed strategies.
-  - Store the source hash in the manifest.
-  - `approve` refuses 0 steps. If the design hash differs from the manifest's source hash, it
-    re-extracts the steps, shows the step diff, and needs explicit confirmation; `--yes` must not
-    cover a design change.
-- **Done when.** The bash-comment plan yields 3 steps with their full text. An "Acceptance criteria"
-  list is flagged as ambiguous. `build --yes` on a zero-step run refuses. Re-approving an edited
-  design updates the steps or refuses.
 
 ### H4. No baseline snapshot at init; a dirty checkout is adopted silently in snapshot mode
 
@@ -120,6 +57,8 @@ are given as file + function (line numbers drift). Suggested order is at the end
   - included in the evidence and the review range;
   - impossible to tell apart later.
 - **Where.** `Controller.init`.
+- **Note (since `d957ca9`).** The deny-list scan reads `Git.addedContent` (added lines and new files
+  vs base) and the scope check reads `Git.changedFiles`. Baseline exclusion belongs in those two places.
 - **Fix.**
   - Snapshot at init and persist it, together with a baseline patch.
   - A dirty checkout requires an explicit `--adopt-dirty`, shown at approval.
@@ -140,6 +79,9 @@ are given as file + function (line numbers drift). Suggested order is at the end
   all count as gate failures, so they consume `maxImplAttemptsPerStep` and the hardening budgets.
   `maxInfraRetries` is never read.
 - **Where.** `src/controller.ts` (the post-session handling in each `do*` handler); `RunConfig`.
+- **Note (since `d957ca9`).** `validateConfig` checks `maxInfraRetries` (integer >= 0), but nothing
+  reads it yet. `GateInput.artifactProblem` says why an artifact was rejected; use it to tell "no
+  artifact" apart from "wrong artifact".
 - **Fix.**
   - Classify each failure:
     - no artifact plus an abnormal exit or a timeout: infrastructure, with its own counter bounded
@@ -151,16 +93,6 @@ are given as file + function (line numbers drift). Suggested order is at the end
   - A timed-out session doesn't use up the step's attempts.
   - `pi` missing from PATH blocks the run, with a clear reason.
   - Exhausting the infra budget stops the run with an infrastructure stop reason.
-
-### H6. Artifact identity isn't checked (rest of original High item 11; lower risk now)
-
-- **Problem.** `validateArtifact` checks the artifact's shape but not that it belongs to this
-  session. `runId`, `stepId` and `kind` aren't compared with the expected values, and `createdAt`
-  isn't compared with the session start. Per-attempt paths and stale-file renaming make a mix-up
-  unlikely, but the spec calls for typed, verified handoffs.
-- **Where.** `src/gating.ts` (`validateArtifact`), and its callers in `src/controller.ts`.
-- **Fix.** Pass the expected `{runId, stepId, kind, startedAt}` and reject mismatches as "no valid artifact".
-- **Done when.** An artifact with the wrong `stepId`, `kind`, or an earlier `createdAt` fails the gate.
 
 ---
 
@@ -193,20 +125,6 @@ are given as file + function (line numbers drift). Suggested order is at the end
 - **Done when.** A lock from a previous boot is taken over, a live lock from another host is
   refused, and a reused pid isn't mistaken for the original process.
 
-### M3. Review report parsing is lenient where it should pause
-
-- **Problem.**
-  - The first ` ```qfb-review ` block wins, so a quoted or example block earlier in the report gets
-    parsed instead of the real one.
-  - Duplicate finding IDs aren't detected.
-  - The block is written by the LLM driving `review-pr`, not by the skill itself (spec §8.1).
-  - `testGatePassed` is a boolean the agent writes itself. The controller's final regression run
-    now limits the damage.
-- **Where.** `src/report.ts` (`extractBlock`, `parseFindings`).
-- **Fix.** Require exactly one block, otherwise treat the report as ambiguous. Reject duplicate IDs.
-  Settling the surface itself belongs to Milestone 0 (M6).
-- **Done when.** A report with two blocks, or with duplicate IDs, pauses as ambiguous.
-
 ### M4. Herdr integration is cosmetic
 
 - **Problem.**
@@ -229,6 +147,8 @@ These scenarios are still untested or unenforced:
 - **No concurrent Maven.** Stray reaping is tested in `test/procs.test.ts`, but nothing asserts
   outright that two Maven runs never overlap.
 - **Inherited changes stay protected in snapshot mode** (depends on H4).
+- **`build`'s approval gate** (`cmdBuild`: `--yes` refuses ambiguous plans and re-approvals) is only
+  exercised by hand; the controller side (`refreshPlan`, `approve`) is tested.
 - **A hardening test that exposed a bug is preserved and not weakened.** There's no mechanical
   check. Deleting the test is partly caught, because Surefire fails when `-Dtest=` matches nothing.
   Weakening its assertions isn't caught at all. Consider comparing file digests of the exposing
@@ -247,8 +167,8 @@ These scenarios are still untested or unenforced:
   The 30-minute inactivity timer could also kill a legitimate long Maven run if JSON mode prints
   nothing while a tool is running.
 - **Fix.** Run the opt-in smoke test described in `docs/FEASIBILITY.md`. Record the observed event
-  sequence, and adjust the adapter and timeout behaviour to match. Decide M3 (the report surface)
-  and M4 (Herdr) here too.
+  sequence, and adjust the adapter and timeout behaviour to match. Decide the report surface (the
+  part of M3 that `d957ca9` left open: who writes the `qfb-review` block) and M4 (Herdr) here too.
 - **Done when.** All four feasibility criteria are marked as established, with evidence.
 
 ### M7. `doctor` doesn't check what the spec requires
@@ -272,11 +192,6 @@ These scenarios are still untested or unenforced:
     `handoff` or `coverage-gap`.
   - It has false negatives: a copy of the design doc under another name passes. Comparing new files
     against the design and handoff content hashes would catch it.
-- **F2. The base ref isn't resolved to a SHA.** `qfb init --base origin/master` stores the ref name.
-  After a fetch, the review range, fingerprints and deny-list scan all quietly shift; spec §7 wants
-  the range anchored. `build` derives a merge-base SHA, so only `init --base REF` is affected.
-  Resolve the ref with `git rev-parse --verify REF^{commit}` at init, and fold this into H2's
-  base-ref validation.
 - **F3. Commit-mode crash window.** `Git.commitAll` runs before the outcome transaction. A crash in
   between replays the outcome, and the gate then sees HEAD moved and pauses. That's safe, but it
   needs an operator. Record the checkpoint intent (parent + message) before committing, and accept
@@ -298,22 +213,28 @@ These scenarios are still untested or unenforced:
     cleared from this host, and `stop` can't kill that session.
   - It returns `false` when no pid was recorded (assumed never spawned).
   - Document this, or add an audited `qfb resume --force`.
-- **F7. `approve()` works on any paused run.** It re-freezes the design hash and returns to the
-  paused phase even when the pause had nothing to do with the design. Using it as a resume skips
-  `resume`'s open-session check; `run()` still reconciles before launching, so no second writer
-  starts. Restrict `approve` to `AWAITING_APPROVAL` and to pauses caused by a design change.
-- **F8. An already-open PR goes stale.** `openPrIfNone` returns the existing URL without pushing the
-  newly accepted commit. Push the verified commit, then report the URL.
-- **F9. CLI input validation.** `--level` isn't validated (NaN or out of range is accepted), and
-  numeric config values aren't checked.
+
+## Follow-ups found while fixing `d957ca9`
+
+- **F10. Upgrading runs that are in flight.**
+  - The dirty fingerprint now includes binary content and streams large untracked files, so its
+    values changed. A review in progress across the upgrade can pause as "modified the checkout"
+    (resume re-reviews). A run that completed before the upgrade, but whose PR was not pushed yet,
+    refuses the `build` push ("tree no longer matches").
+  - List-strategy steps now keep their full bodies. Re-approving an edited design for a run approved
+    before the upgrade shows multi-line steps as edited (`-`/`+`). Accepting that re-runs them.
+  - Both are one-time; starting a new run avoids them.
+- **F11. Unscannable vetting is per file content, recorded on resume.** There's no way to list or
+  revoke vetted files apart from the `unscannable-accepted` counter and the transition evidence.
+  Consider a `qfb status` section and a `--revoke`.
+- **F12. Very short deny terms.** Substring matching makes a 2-character term (e.g. a customer called
+  `HP`) flag `http`/`php`. `init` only warns. If this bites, add an opt-in whole-word mode per term.
 
 ---
 
 ## Suggested order
 
-1. **H2, then H1.** These are small, contained changes that close a run-stopping failure and two
-   fail-open security holes. Fold F2 into H2.
-2. **H3.** Plan fidelity: a dropped step is silent scope loss.
-3. **M6 (Milestone 0) before any further large work.** It may change the backend (M4) and the report
-   surface (M3), and the spec treats it as a hard gate.
-4. **H4, H5, H6**, then the medium items and follow-ups as needed.
+1. **M6 (Milestone 0) before any further large work.** It may change the backend (M4) and the report
+   surface (M3's format), and the spec treats it as a hard gate.
+2. **H4, H5**, then the medium items and follow-ups as needed. H5's failure classification depends
+   on how Pi really exits and times out, which M6 establishes.
