@@ -53,13 +53,18 @@ test("RpcPiAdapter: own process group, pid reported, artifact read, strays reape
   const d = tmp();
   const artifactPath = join(d, "a.json");
   const strayFile = join(d, "stray.pid");
-  fakePi(d, `cat >/dev/null; sleep 30 & echo $! > ${strayFile}; echo '{"status":"DONE"}' > ${artifactPath}; exit 0`);
+  const argsFile = join(d, "args");
+  fakePi(d, `printf '%s\\n' "$@" > ${argsFile}; cat >/dev/null; sleep 30 & echo $! > ${strayFile}; echo '{"status":"DONE"}' > ${artifactPath}; exit 0`);
   let spawned = 0;
   const pi = new RpcPiAdapter();
+  const sessionDir = join(d, "pi-sessions");
   const r = await pi.launch({
-    runId: "r", stepId: "S1", cwd: d, prompt: "p", sessionId: "s1", artifactPath,
+    runId: "r", stepId: "S1", cwd: d, prompt: "p", sessionId: "s1", artifactPath, sessionDir,
     inactivityTimeoutMs: 10_000, onSpawn: (pid) => (spawned = pid),
   });
+  // Pi keeps its session files where QFB says, so `qfb clean` can remove them.
+  const argv = readFileSync(argsFile, "utf8").split("\n");
+  assert.equal(argv[argv.indexOf("--session-dir") + 1], sessionDir);
   assert.ok(spawned > 0);
   assert.equal(r.settled, true);
   assert.equal(r.artifact?.status, "DONE");
@@ -76,6 +81,7 @@ test("RpcPiAdapter.terminate kills a live session tree (used by `qfb stop`)", as
   let pid = 0;
   const pending = pi.launch({
     runId: "r", stepId: "S1", cwd: d, prompt: "p", sessionId: "s2", artifactPath: join(d, "b.json"),
+    sessionDir: join(d, "pi-sessions"),
     inactivityTimeoutMs: 60_000, onSpawn: (p) => (pid = p),
   });
   await new Promise((res) => setTimeout(res, 200));

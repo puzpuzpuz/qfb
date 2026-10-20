@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, realpathSync, rmSync } from "node:fs";
 import { writeFile, readFile } from "node:fs/promises";
 import { hostname } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Store } from "./store.ts";
 import type { RunRow, SessionRow } from "./store.ts";
 import type { PaneLabel } from "./adapters/herdr.ts";
@@ -122,6 +122,9 @@ class HaltSignal extends Error {}
 
 const STOP_STATES: StateName[] = [State.COMPLETED, State.FAILED, State.PAUSED, State.BLOCKED, State.RECONCILIATION];
 export const DESIGN_CHANGED = "Approved design changed after approval; re-approval required.";
+
+/** A run id `clean` will act on: one path segment, so it can never escape the artifact root. */
+const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 // Counter keys.
 const PAUSE_REQUEST = "request-pause";
@@ -1115,6 +1118,66 @@ export class Controller {
     }
   }
 
+  // ---------------------------------------------------------------- clean
+  /**
+   * What `clean` deletes: the run's row (null if unknown) and its existing
+   * artifact directories. Read-only. A run started under another
+   * QFB_ARTIFACTS keeps its files there, so the paths QFB recorded are
+   * followed too, but only into a directory named for this run.
+   */
+  cleanTargets(runId: string): { run: RunRow | null; paths: string[] } {
+    if (!SAFE_RUN_ID.test(runId)) throw new Error(`Invalid run id ${JSON.stringify(runId)}.`);
+    const run = this.store.getRun(runId);
+    const dirs = new Set([join(this.artifactRoot, runId)]);
+    if (run) {
+      const recorded = [
+        this.store.getCounter(runId, "prepared-plan-path"),
+        ...this.store.getSessions(runId).map((s) => s.artifact_path as string | null),
+      ];
+      for (const p of recorded) if (p && basename(dirname(p)) === runId) dirs.add(dirname(p));
+    }
+    return { run, paths: [...dirs].filter((d) => existsSync(d)) };
+  }
+
+  /**
+   * Delete everything QFB keeps for a run: its rows in every state-store table
+   * and its artifact directory (plan manifest, task artifacts, transcripts, Pi
+   * session files, test logs, review/fix reports, interrupted-session patches).
+   * Never touches the checkout or its commits. Refuses while a controller holds
+   * the run or one of its sessions may still be running. Re-running finishes an
+   * interrupted clean: leftover files are removed once the rows are gone.
+   */
+  async clean(runId: string): Promise<{ existed: boolean; rows: number; removed: string[]; scrubbed: boolean }> {
+    const leftover = this.cleanTargets(runId);
+    if (!leftover.run) {
+      if (leftover.paths.length === 0) throw new Error(`Unknown run ${runId}`);
+      for (const p of leftover.paths) rmSync(p, { recursive: true, force: true });
+      // The earlier clean deleted (and reported on scrubbing) the rows.
+      return { existed: false, rows: 0, removed: leftover.paths, scrubbed: true };
+    }
+    if (!this.store.acquireLock(runId)) throw new Error(`${this.lockedMessage(runId)} Stop it before cleaning.`);
+    let targets: { paths: string[] };
+    let deleted: { rows: number; scrubbed: boolean };
+    try {
+      for (const s of this.store.openSessions(runId)) {
+        if (await this.pi.isRunning(ref(s))) {
+          throw new Error(
+            `Session ${s.sessionId} (pid ${s.pid} on ${s.host}) is still running; 'qfb stop ${runId}' first, or wait for it to exit.`,
+          );
+        }
+      }
+      targets = this.cleanTargets(runId);
+      // Rows before files: a failed file removal is finished by re-running clean,
+      // whereas a live run with missing artifacts would lose its evidence and
+      // its regression suite.
+      deleted = this.store.deleteRun(runId);
+    } finally {
+      this.store.releaseLock(runId);
+    }
+    for (const p of targets.paths) rmSync(p, { recursive: true, force: true });
+    return { existed: true, ...deleted, removed: targets.paths };
+  }
+
   status(runId: string): Record<string, unknown> {
     const run = this.requireRun(runId);
     const steps = this.store.getSteps(runId);
@@ -1242,6 +1305,7 @@ export class Controller {
       cwd: run.repoPath,
       sessionId: o.sessionId,
       artifactPath: o.artifactPath,
+      sessionDir: this.artifactPath(run.id, "pi-sessions"),
       inactivityTimeoutMs: run.config.sessionInactivityTimeoutMs,
       prompt: o.prompt,
       onSpawn: (pid) => this.store.setSessionPid(rowId, pid, hostname()),

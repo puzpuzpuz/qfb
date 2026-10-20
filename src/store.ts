@@ -237,6 +237,39 @@ export class Store {
     return r ? this.getRun(r.id) : null;
   }
 
+  /**
+   * Delete every row that belongs to `runId`, in every table, atomically, then
+   * compact the database. Updates leave older versions of a row in free space,
+   * so deleting is not enough: VACUUM rebuilds every page from the live rows,
+   * and the checkpoint carries that into the database file, so nothing of the
+   * run (deny-list terms, plan text, evidence) remains. `scrubbed` is false if
+   * another process kept the compaction from completing; the rows are gone
+   * either way (overwritten by secure_delete), and the next clean compacts again.
+   */
+  deleteRun(runId: string): { rows: number; scrubbed: boolean } {
+    const prev = (this.db.prepare("PRAGMA secure_delete").get() as { secure_delete: number }).secure_delete;
+    this.db.exec("PRAGMA secure_delete = ON");
+    let rows = 0;
+    try {
+      this.tx(() => {
+        for (const t of RUN_TABLES) {
+          rows += Number(this.db.prepare(`DELETE FROM ${t} WHERE run_id = ?`).run(runId).changes);
+        }
+        rows += Number(this.db.prepare("DELETE FROM runs WHERE id = ?").run(runId).changes);
+      });
+    } finally {
+      this.db.exec(`PRAGMA secure_delete = ${prev}`);
+    }
+    let scrubbed = false;
+    try {
+      this.db.exec("VACUUM");
+      scrubbed = (this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number }).busy === 0;
+    } catch {
+      // Busy: another process is writing. Reported, not fatal.
+    }
+    return { rows, scrubbed };
+  }
+
   listRuns(): RunRow[] {
     const rows = this.db.prepare("SELECT id FROM runs ORDER BY created_at DESC").all() as { id: string }[];
     return rows.map((r) => this.getRun(r.id)!).filter(Boolean);
@@ -512,6 +545,9 @@ export class Store {
     this.db.close();
   }
 }
+
+/** Every table keyed by `run_id` (`runs` itself is keyed by `id`). Locks hold the run's lock row. */
+const RUN_TABLES = ["steps", "transitions", "sessions", "checkpoints", "reviews", "counters", "locks"] as const;
 
 function toSessionRow(r: Record<string, unknown>): SessionRow {
   return {

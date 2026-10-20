@@ -178,6 +178,7 @@ An agent's `DONE` is a **claim, not a result** — it is only an input to the ga
 | `qfb resume RUN_ID --accept-unscannable` | Record that you vetted the files the confidentiality scan could not read (binary, too large, unreadable); the vetting covers exactly that content. |
 | `qfb logs RUN_ID` | Locate transcripts, test logs, review/fix reports. |
 | `qfb list` | List known runs. |
+| `qfb clean RUN_ID [--yes]` | Permanently delete a run's state-store records and its artifact directory (manifest, transcripts, Pi session files, test logs, reports, patches). Asks for confirmation unless `--yes`. Refuses while a controller or session is still live; never touches the checkout or its commits. |
 
 Flags: `--commit` (commit-checkpoint policy instead of snapshot-only), `--strict` (resolve all
 actionable findings, not just Critical), `--level N` (review level 0–3, default 2; anything else is
@@ -190,6 +191,14 @@ Run state lives **outside** the QuestDB source tree, under your XDG state dir
 (`$XDG_STATE_HOME/qfb` or `~/.local/state/qfb`): a SQLite database plus versioned filesystem
 artifacts. Override with `QFB_DB` and `QFB_ARTIFACTS`. QFB's own working materials (the design doc,
 handoff documents, reports) are **never** committed to or `.gitignore`d in the QuestDB checkout.
+Pi's own session files for a run (including nested review/fix subagents) are kept in
+`artifacts/<run-id>/pi-sessions/`, not in Pi's default session store.
+
+**Cleaning up.** `qfb clean RUN_ID` deletes everything QFB keeps for a run: its rows in every
+state-store table and its artifact directory. It then compacts the database (`VACUUM`), because
+deleting alone leaves older copies of updated rows (deny-list terms, plan text) in free space. The
+checkout, its commits, and any PR are left alone. If it is interrupted, re-running it removes
+whatever files are left.
 
 **Parallel runs.** By default every run shares one `qfb.sqlite` (runs are rows keyed by `run_id`);
 only artifacts are split into per-run subdirs under `artifacts/<run-id>/`. Different features can run

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { dirname, join } from "node:path";
 import { makeHarness, artifact, THREE_STEP_DESIGN } from "./helpers.ts";
 import { PlanChangedError } from "../src/controller.ts";
@@ -934,4 +935,128 @@ test("init validates configuration and the deny-list", () => {
   assert.throws(() => init({ config: { maxReviewIterations: 0 } }), /maxReviewIterations must be an integer >= 1/);
   assert.throws(() => init({ denyList: ["--"] }), /has no letters or digits/);
   assert.ok(init({ denyList: ["HP"] }).notes.some((n: string) => /very short/.test(n)));
+});
+
+// ------------------------------------------------------------------ clean
+
+/** Rows left for `runId` in every table of the state store (found from the schema, not hardcoded). */
+function leftoverRows(h: Harness, runId: string): Record<string, number> {
+  const db = new DatabaseSync(join(h.dir, "state.sqlite"));
+  try {
+    const out: Record<string, number> = {};
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
+    for (const { name } of tables) {
+      const cols = (db.prepare(`PRAGMA table_info(${name})`).all() as { name: string }[]).map((c) => c.name);
+      const key = cols.includes("run_id") ? "run_id" : "id";
+      out[name] = (db.prepare(`SELECT COUNT(*) c FROM ${name} WHERE ${key} = ?`).get(runId) as { c: number }).c;
+    }
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+test("clean deletes the run's rows in every table and its artifacts (incl. Pi sessions), leaving other runs intact", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [implDone("S1"), ...happyTail()]);
+  const runId = start(h, { checkpointPolicy: "commit" });
+  const { runId: other } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "other-base" });
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+
+  const dir = join(h.dir, "artifacts", runId);
+  // Pi was told to keep its own session files inside the run's artifact dir.
+  assert.ok(h.pi.launches.length > 0 && h.pi.launches.every((l) => l.sessionDir === join(dir, "pi-sessions")));
+  const before = leftoverRows(h, runId);
+  for (const t of ["runs", "steps", "transitions", "sessions", "checkpoints", "reviews", "counters"]) {
+    assert.ok(before[t]! > 0, `expected ${t} rows before clean`);
+  }
+  const otherBefore = leftoverRows(h, other);
+
+  const r = await h.controller.clean(runId);
+  assert.equal(r.existed, true);
+  // +1: clean's own run lock, held while deleting and deleted with the rest.
+  assert.equal(r.rows, Object.values(before).reduce((a, b) => a + b, 0) + 1);
+  assert.deepEqual(r.removed, [dir]);
+  assert.ok(!existsSync(dir));
+  assert.ok(Object.values(leftoverRows(h, runId)).every((n) => n === 0), JSON.stringify(leftoverRows(h, runId)));
+  assert.throws(() => h.controller.status(runId), /Unknown run/);
+  await assert.rejects(() => h.controller.clean(runId), /Unknown run/);
+
+  // The other run in the shared store is untouched.
+  assert.deepEqual(leftoverRows(h, other), otherBefore);
+  assert.equal(h.controller.status(other).state, "AWAITING_APPROVAL");
+  assert.ok(existsSync(join(h.dir, "artifacts", other, "prepared-plan.md")));
+});
+
+test("clean leaves no trace of the run's confidential data in the database files", async () => {
+  // Pausing with a long reason grows the run's row, so SQLite moves it and leaves the old copy
+  // (deny-list included) in free space, where deleting the row never reaches it.
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    () => ({ artifact: artifact({ stepId: "S1", status: "NEEDS_DECISION", summary: "needs a call ".repeat(40) }) }),
+  ]);
+  const term = "ZephyrQuokkaHoldings";
+  const runId = start(h, {}, [term]);
+  assert.equal(await h.controller.run(runId), "paused");
+  await h.controller.resume(runId);
+  const dbBytes = () =>
+    ["state.sqlite", "state.sqlite-wal"]
+      .map((f) => join(h.dir, f))
+      .filter((f) => existsSync(f))
+      .map((f) => readFileSync(f, "latin1"))
+      .join("");
+  assert.ok(dbBytes().includes(term), "precondition: the deny-list is stored");
+  assert.equal((await h.controller.clean(runId)).scrubbed, true);
+  const left = dbBytes();
+  assert.ok(!left.includes(term), "freed space must not keep the deny-list");
+  assert.ok(!left.includes(runId), "freed space must not keep any of the run's rows");
+});
+
+test("clean refuses while a controller holds the run or a session may still be running", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, []);
+  const runId = start(h);
+  const dir = join(h.dir, "artifacts", runId);
+
+  assert.equal(h.store.acquireLock(runId), true); // a live controller drives the run
+  await assert.rejects(() => h.controller.clean(runId), /locked by another controller.*Stop it before cleaning/);
+  h.store.releaseLock(runId);
+
+  // A crashed controller's session is still alive: deleting its records would lose track of it.
+  h.store.setState(runId, "IMPLEMENTING" as never);
+  const row = h.store.recordSession(runId, "S1", "implementation", `${runId}-S1-a1`, null, join(dir, "S1-attempt1.json"));
+  h.store.setSessionPid(row, 4242, "host");
+  h.pi.orphans.add(`${runId}-S1-a1`);
+  await assert.rejects(() => h.controller.clean(runId), /still running; 'qfb stop/);
+  assert.equal(h.controller.status(runId).state, "IMPLEMENTING");
+  assert.ok(existsSync(dir));
+
+  h.pi.orphans.clear(); // it exited
+  assert.equal((await h.controller.clean(runId)).existed, true);
+  assert.ok(!existsSync(dir));
+});
+
+test("clean finishes an interrupted clean, follows recorded artifact paths, and never leaves the run's dirs", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, []);
+
+  // A crash after the rows were deleted but before the files were: re-running clean removes them.
+  const a = start(h);
+  h.store.deleteRun(a);
+  const aDir = join(h.dir, "artifacts", a);
+  assert.ok(existsSync(aDir));
+  assert.deepEqual(await h.controller.clean(a), { existed: false, rows: 0, removed: [aDir], scrubbed: true });
+  assert.ok(!existsSync(aDir));
+
+  // A run started under another artifact root (QFB_ARTIFACTS) is found through its recorded paths;
+  // a recorded path outside a directory named for the run never deletes that directory.
+  const b = start(h);
+  const elsewhere = join(h.dir, "elsewhere", b);
+  mkdirSync(elsewhere, { recursive: true });
+  h.store.recordSession(b, "S1", "implementation", `${b}-S1-a1`, null, join(elsewhere, "S1-attempt1.json"));
+  h.store.recordSession(b, "S2", "implementation", `${b}-S2-a1`, null, join(h.dir, "a1.json"));
+  const { removed } = await h.controller.clean(b);
+  assert.deepEqual(removed.sort(), [join(h.dir, "artifacts", b), elsewhere].sort());
+  assert.ok(!existsSync(elsewhere));
+  assert.ok(existsSync(h.designPath), "the harness dir holding the design survives");
+
+  for (const bad of ["..", "../x", "a/b", "", ".hidden"]) {
+    await assert.rejects(() => h.controller.clean(bad), /Invalid run id/);
+  }
 });

@@ -129,6 +129,9 @@ Granular / recovery commands:
   qfb stop RUN_ID
   qfb logs RUN_ID
   qfb list
+  qfb clean RUN_ID [--yes]
+      Permanently delete the run's state-store records and its artifacts
+      (transcripts, Pi sessions, logs, reports). Never touches the checkout.
 
 State store: ${stateDir()}
 `;
@@ -242,6 +245,10 @@ async function main(): Promise<void> {
       for (const r of store.listRuns()) process.stdout.write(`${r.id}  ${r.state}  (${r.repoPath})\n`);
       break;
     }
+    case "clean":
+    case "cleanup":
+      await cmdClean(ctl, requireId(_), Boolean(flags.yes));
+      break;
     default:
       throw new Error(`Unknown command: ${cmd}`);
   }
@@ -400,6 +407,33 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
   }
 
   out(`\n\u2713 Feature complete: ${runId}`);
+}
+
+/** Delete a run's records and artifacts, after confirmation unless --yes. */
+async function cmdClean(ctl: Controller, runId: string, yes: boolean): Promise<void> {
+  const out = (s: string) => process.stdout.write(s + "\n");
+  const { run, paths } = ctl.cleanTargets(runId);
+  if (!run && paths.length === 0) throw new Error(`Unknown run ${runId}`);
+  if (!yes) {
+    out(run ? `Run ${runId}: ${run.state}, ${run.repoPath}` : `Run ${runId} has no records left, only files.`);
+    out("This permanently deletes:");
+    if (run) out(`  - its records in ${dbPath()}`);
+    for (const p of paths) out(`  - ${p}`);
+    out("The checkout and its commits are not touched.");
+    if (run && run.state !== State.COMPLETED) {
+      out(`! The run is not completed: its progress is lost, and re-running 'qfb build' starts a new run.`);
+    }
+    if (!process.stdin.isTTY) throw new Error("Confirmation required; re-run with --yes.");
+    if (!(await confirm(`Delete ${runId}? [y/N] `))) {
+      out("Nothing deleted.");
+      return;
+    }
+  }
+  const r = await ctl.clean(runId);
+  out(`Cleaned ${runId}: ${r.rows} state-store row(s), ${r.removed.length} artifact dir(s) deleted.`);
+  if (!r.scrubbed) {
+    out(`! Another QFB process is using ${dbPath()}, so it could not be compacted: remnants of the run may stay in its free space until the next 'qfb clean'.`);
+  }
 }
 
 /** Human-oriented detail for `qfb status --verbose`. */

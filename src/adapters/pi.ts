@@ -24,6 +24,11 @@ export interface PiLaunchRequest {
   sessionId: string;
   /** Where the agent must write its typed artifact. */
   artifactPath: string;
+  /**
+   * Where Pi stores this session (and its nested subagents' sessions): inside
+   * the run's artifact directory, so `qfb clean` removes them with the run.
+   */
+  sessionDir: string;
   inactivityTimeoutMs: number;
   /**
    * Called as soon as the session process exists, with its pid (which is also
@@ -86,6 +91,7 @@ export class RpcPiAdapter implements PiAdapter {
       "--mode", "json",
       "--print",
       "--session-id", req.sessionId,
+      "--session-dir", req.sessionDir,
       "--name", `qfb-${req.runId}-${req.stepId}`,
     ];
     // Own process group: on timeout/stop we signal the whole tree, and on exit

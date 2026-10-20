@@ -151,6 +151,8 @@ qfb logs   run-xxxxxxxx             # the artifact dir: per-session *.transcript
 
 Each live Pi session streams its stdout/stderr to `<artifact>.transcript.log`, so
 `tail -f ~/.local/state/qfb/artifacts/<run-id>/*.transcript.log` gives you the raw agent output.
+Pi's own session files live in `artifacts/<run-id>/pi-sessions/`; browse them from the checkout with
+`pi --session-dir ~/.local/state/qfb/artifacts/<run-id>/pi-sessions -r`.
 
 If Herdr is active, panes are labelled with the feature, phase, step ID, and review iteration so you
 can watch live. Remember: a pane going idle is **not** proof of completion.
@@ -230,3 +232,25 @@ full evidence. `qfb run` **does not** push, open/merge PRs, or deploy — that r
 `qfb build` (unless `--no-pr`) pushes the accepted commit and opens a PR, nothing else. If a PR is
 already open for the branch, it still pushes the accepted commit (never forced), so the PR is not
 left behind.
+
+## Cleaning up
+
+Once you no longer need a run's evidence, delete it:
+
+```bash
+qfb clean run-xxxxxxxx         # lists what will be deleted and asks for confirmation
+qfb clean run-xxxxxxxx --yes   # non-interactive
+```
+
+This removes the run's records from every state-store table and its artifact directory (plan
+manifest, typed artifacts, transcripts, Pi session files, test logs, review/fix reports,
+interrupted-session patches), then compacts the database, so older copies of updated rows (deny-list
+terms, plan text) do not linger in its free space. If another QFB process keeps the compaction from
+completing, `clean` says so, and the next `clean` compacts again. The checkout, its commits, and any
+PR are **not** touched. `clean` refuses while a controller holds the run or one of its sessions may still be
+running: `qfb stop` it first. Cleaning an unfinished run discards its progress, so re-running
+`qfb build` starts a new run. Other runs in a shared store are unaffected.
+
+Runs started before QFB kept Pi sessions in `pi-sessions/` left their Pi session files in Pi's
+own store (`~/.pi/agent/sessions/<encoded checkout path>/*_<run-id>-*.jsonl`); `clean` does not
+touch Pi's store, so remove those by hand if needed.

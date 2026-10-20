@@ -40,7 +40,7 @@ Node process; there is no server, broker, or scheduler.
 | `src/report.ts` | Parses `review-pr`'s machine-readable ```qfb-review``` surface (exactly one block, unique finding IDs); **pauses on ambiguity** instead of guessing. Selects actionable findings by policy; computes acceptance. |
 | `src/identity.ts` | One shared identity + no-progress mechanism, instantiated over review findings and hardening bug entries. |
 | `src/git.ts` | Read-mostly Git wrapper. Snapshots branch/HEAD/dirty-fingerprint/submodule/untracked; derives changed files and the content a change adds (for the confidentiality scan). Output is independent of user Git config, unbounded by buffer size in practice (1 GiB), and every failure throws `GitError`, which pauses the run: no fallback comparison is ever substituted. Checkpoint-commit only. **No destructive commands exist in the code.** |
-| `src/adapters/pi.ts` | `PiAdapter` interface + `RpcPiAdapter`. Launches a fresh session, returns structured lifecycle info and the **typed artifact** — the only trusted completion signal. |
+| `src/adapters/pi.ts` | `PiAdapter` interface + `RpcPiAdapter`. Launches a fresh session, returns structured lifecycle info and the **typed artifact** — the only trusted completion signal. Pi's session files go to `--session-dir artifacts/<run-id>/pi-sessions`, so everything a run produces lives under its artifact dir (and `qfb clean` removes it). |
 | `src/adapters/herdr.ts` | `HerdrAdapter` interface + `CliHerdrAdapter`/`NullHerdrAdapter`. Pane labels, observation (never trusted as completion), output collection. |
 | `src/doctor.ts` | Preflight checks (Pi/Herdr/git/sqlite/skills/execution mode). |
 | `src/paths.ts` | XDG state-dir resolution; `QFB_DB` / `QFB_ARTIFACTS` overrides. |
