@@ -10,15 +10,22 @@ export class AmbiguousReportError extends Error {}
  * fenced ```qfb-review JSON block (the documented structured-output contract).
  * If the block is absent or the verdict/finding boundaries cannot be identified
  * with confidence, we PAUSE by throwing AmbiguousReportError rather than
- * guessing boundaries with heuristics.
+ * guessing boundaries with heuristics. Exactly one block is accepted: with two
+ * (e.g. a quoted example plus the real one) we cannot tell which is the verdict.
  */
 export function parseReviewReport(raw: string): ReviewReport {
-  const block = extractBlock(raw, "qfb-review");
-  if (!block) {
+  const blocks = extractBlocks(raw, "qfb-review");
+  if (blocks.length === 0) {
     throw new AmbiguousReportError(
       "No machine-readable qfb-review block found; cannot determine verdict or finding boundaries.",
     );
   }
+  if (blocks.length > 1) {
+    throw new AmbiguousReportError(
+      `Found ${blocks.length} qfb-review blocks; exactly one is required to know which holds the verdict.`,
+    );
+  }
+  const block = blocks[0]!;
 
   let parsed: unknown;
   try {
@@ -47,12 +54,17 @@ function parseFindings(value: unknown): Finding[] {
   if (!Array.isArray(value)) {
     throw new AmbiguousReportError("findings must be an array.");
   }
+  const seen = new Set<string>();
   return value.map((f, i) => {
     const o = f as Record<string, unknown>;
     const severity = normalizeSeverity(o.severity);
     if (typeof o.id !== "string" || !o.id) {
       throw new AmbiguousReportError(`finding[${i}] has no stable id.`);
     }
+    if (seen.has(o.id)) {
+      throw new AmbiguousReportError(`finding id ${JSON.stringify(o.id)} appears more than once; finding boundaries are unclear.`);
+    }
+    seen.add(o.id);
     if (!severity) {
       throw new AmbiguousReportError(`finding[${i}] has unrecognized severity: ${JSON.stringify(o.severity)}`);
     }
@@ -65,10 +77,9 @@ function parseFindings(value: unknown): Finding[] {
   });
 }
 
-function extractBlock(raw: string, tag: string): string | null {
-  const re = new RegExp("```" + tag + "\\s*\\n([\\s\\S]*?)```", "m");
-  const m = re.exec(raw);
-  return m ? m[1]!.trim() : null;
+function extractBlocks(raw: string, tag: string): string[] {
+  const re = new RegExp("```" + tag + "[ \\t]*\\r?\\n([\\s\\S]*?)```", "g");
+  return [...raw.matchAll(re)].map((m) => m[1]!.trim());
 }
 
 function normalizeVerdict(v: unknown): VerdictName | null {

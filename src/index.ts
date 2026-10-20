@@ -2,7 +2,8 @@
 import { createInterface } from "node:readline/promises";
 import { readFileSync } from "node:fs";
 import { Store } from "./store.ts";
-import { Controller } from "./controller.ts";
+import { Controller, DESIGN_CHANGED, PlanChangedError } from "./controller.ts";
+import type { PlanInfo } from "./controller.ts";
 import { Git } from "./git.ts";
 import { RpcPiAdapter } from "./adapters/pi.ts";
 import { CliHerdrAdapter, NullHerdrAdapter } from "./adapters/herdr.ts";
@@ -74,13 +75,26 @@ function parseRunFlags(
   flags: Record<string, string | boolean>,
   defaults: { commit?: boolean } = {},
 ): { denyList: string[]; config: Partial<RunConfig> } {
+  if (flags.deny === true) throw new Error("--deny requires a comma-separated list of terms");
   const denyList = typeof flags.deny === "string" ? flags.deny.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  let reviewLevel: 0 | 1 | 2 | 3 | undefined;
+  if (flags.level !== undefined) {
+    if (typeof flags.level !== "string" || !/^[0-3]$/.test(flags.level)) {
+      throw new Error(`--level must be 0, 1, 2 or 3 (got ${flags.level === true ? "no value" : JSON.stringify(flags.level)})`);
+    }
+    reviewLevel = Number(flags.level) as 0 | 1 | 2 | 3;
+  }
   const config: Partial<RunConfig> = {
     ...(flags.commit || defaults.commit ? { checkpointPolicy: "commit" as const } : {}),
     ...(flags.strict ? { strictReviewPolicy: true } : {}),
-    ...(typeof flags.level === "string" ? { reviewLevel: Number(flags.level) as 0 | 1 | 2 | 3 } : {}),
+    ...(reviewLevel !== undefined ? { reviewLevel } : {}),
   };
   return { denyList, config };
+}
+
+function printPlanChange(diff: string[], out: (s: string) => void): void {
+  out("The design changed, and with it the plan steps (+ new, - removed):");
+  for (const d of diff) out(`  ${d}`);
 }
 
 async function confirm(question: string): Promise<boolean> {
@@ -111,7 +125,7 @@ Granular / recovery commands:
   qfb run RUN_ID
   qfb status RUN_ID [--verbose]
   qfb pause RUN_ID
-  qfb resume RUN_ID
+  qfb resume RUN_ID [--accept-unscannable]
   qfb stop RUN_ID
   qfb logs RUN_ID
   qfb list
@@ -151,15 +165,31 @@ async function main(): Promise<void> {
       const res = ctl.init({ repoPath: repo, designPath: design, base, denyList, config });
       process.stdout.write(`Created ${res.runId} with ${res.steps} step(s) [strategy: ${res.strategy}].\n`);
       process.stdout.write(`Prepared plan manifest: ${res.preparedPlanPath}\n`);
-      if (res.ambiguous) process.stdout.write(`! Plan is ambiguous — edit the design and re-run init.\n`);
       for (const n of res.notes) process.stdout.write(`  note: ${n}\n`);
+      if (res.steps === 0) {
+        process.stdout.write(`! No steps could be extracted. Edit the design's Implementation Plan; 'qfb approve ${res.runId}' re-extracts it.\n`);
+      } else if (res.ambiguous) {
+        process.stdout.write(
+          `! The plan structure is ambiguous (see the notes). Check the proposed mapping with 'qfb plan ${res.runId}': ` +
+            `approve it as is, or edit the design first ('qfb approve' re-extracts it).\n`,
+        );
+      }
       process.stdout.write(`Next: review the manifest (qfb plan ${res.runId}), then qfb approve ${res.runId}\n`);
       break;
     }
-    case "approve":
-      ctl.approve(requireId(_));
-      process.stdout.write(`Approved ${_[1]}. Next: qfb run ${_[1]}\n`);
+    case "approve": {
+      const id = requireId(_);
+      try {
+        ctl.approve(id);
+      } catch (e) {
+        if (!(e instanceof PlanChangedError)) throw e;
+        printPlanChange(e.diff, (s) => process.stdout.write(s + "\n"));
+        throw e;
+      }
+      if (ctl.status(id).planAmbiguous) process.stdout.write(`! Approved an ambiguous plan mapping as proposed.\n`);
+      process.stdout.write(`Approved ${id}. Next: qfb run ${id}\n`);
       break;
+    }
     case "plan": {
       const st = ctl.status(requireId(_));
       const p = st.preparedPlanPath as string | null;
@@ -191,7 +221,7 @@ async function main(): Promise<void> {
       break;
     }
     case "resume": {
-      const to = await ctl.resume(requireId(_));
+      const to = await ctl.resume(requireId(_), { acceptUnscannable: Boolean(flags["accept-unscannable"]) });
       process.stdout.write(`Resumed ${_[1]} -> ${to}. Next: qfb run ${_[1]} (or re-run 'qfb build ...')\n`);
       break;
     }
@@ -280,21 +310,35 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
 
   // 3. Approval gate (idempotent).
   run = store.getRun(runId)!;
-  const needsApproval =
-    !run.approved ||
-    run.state === State.AWAITING_APPROVAL ||
-    (run.state === State.PAUSED && /re-approval/i.test(run.stopReason ?? ""));
-  if (needsApproval) {
-    if (!flags.yes) {
+  const reapproval = run.state === State.PAUSED && run.stopReason === DESIGN_CHANGED;
+  if (run.state === State.AWAITING_APPROVAL || reapproval) {
+    // Approve exactly what the design on disk says now (re-extracted if it changed).
+    const plan: PlanInfo = ctl.refreshPlan(runId);
+    if (plan.diff.length > 0) printPlanChange(plan.diff, out);
+    for (const n of plan.notes.filter((n) => n.startsWith("AMBIGUOUS"))) out(`  ${n}`);
+    if (plan.steps === 0) {
+      err(`No plan steps could be extracted from ${design}; give it an ordered Implementation Plan, then re-run. Nothing started.`);
+      process.exitCode = 1;
+      return;
+    }
+    // --yes is blanket consent to a clear, first-time plan. It never covers a
+    // changed design or an ambiguous mapping: those need a human to look.
+    const why = reapproval ? "the approved design changed" : plan.ambiguous ? "the plan structure is ambiguous" : null;
+    if (why || !flags.yes) {
       if (!process.stdin.isTTY) {
-        err(`Approval required. Review 'qfb plan ${runId}', then re-run with --yes (or 'qfb approve ${runId}').`);
+        err(
+          why
+            ? `Explicit approval required because ${why}; --yes does not cover this. Review 'qfb plan ${runId}', ` +
+                `then 'qfb approve ${runId}' and re-run 'qfb build ...' (or edit the design and re-run).`
+            : `Approval required. Review 'qfb plan ${runId}', then re-run with --yes (or 'qfb approve ${runId}').`,
+        );
         process.exitCode = 1;
         return;
       }
-      out(`\nReview the normalized plan with: qfb plan ${runId}`);
+      out(`\nReview the normalized plan with: qfb plan ${runId}${why ? `  (attention: ${why})` : ""}`);
       const ok = await confirm(`Approve this plan and start the autonomous build of ${runId}? [y/N] `);
       if (!ok) {
-        out(`Not approved. Left at AWAITING_APPROVAL; re-run 'qfb build ...' to resume.`);
+        out(`Not approved; nothing started. Re-run 'qfb build ...' to resume.`);
         return;
       }
     }
@@ -320,7 +364,11 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
 
   if (state !== State.COMPLETED) {
     err(`\nRun ${runId} stopped in state '${state}': ${st.stopReason ?? ""}`);
-    err(`It is resumable \u2014 address the issue, then 'qfb resume ${runId}' and re-run 'qfb build ...'.`);
+    err(
+      st.stopReason === DESIGN_CHANGED
+        ? `Review the edited design, then re-run 'qfb build ...' to approve the updated plan.`
+        : `It is resumable \u2014 address the issue, then 'qfb resume ${runId}' and re-run 'qfb build ...'.`,
+    );
     process.exitCode = 2;
     return;
   }
@@ -347,7 +395,8 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
       denyList: final.denyList,
     });
     out(pr.opened ? `\n\u2713 Opened PR: ${pr.url}` : `\nPR: ${pr.reason}${pr.url ? ` (${pr.url})` : ""}`);
-    if (!pr.opened && !pr.url) process.exitCode = 3;
+    // Success means a PR now carries the accepted commit (a new one, or an open one we pushed to).
+    if (!pr.opened && !(pr.pushed && pr.url)) process.exitCode = 3;
   }
 
   out(`\n\u2713 Feature complete: ${runId}`);

@@ -30,7 +30,10 @@ export interface RunRow {
   id: string;
   repoPath: string;
   branch: string;
+  /** The feature base as a commit SHA, resolved once at init so the review range never drifts. */
   baseRef: string;
+  /** The base as the operator wrote it (e.g. `origin/master`); null for older runs. */
+  baseSpec: string | null;
   designPath: string;
   designHash: string;
   config: RunConfig;
@@ -148,6 +151,7 @@ export class Store {
       this.db.exec("UPDATE sessions SET consumed_at = ended_at WHERE ended_at IS NOT NULL");
     }
     this.ensureColumn("sessions", "git_before", "TEXT");
+    this.ensureColumn("runs", "base_spec", "TEXT");
   }
 
   /** Add a column if missing; returns true when it was just added. */
@@ -186,12 +190,12 @@ export class Store {
   createRun(row: Omit<RunRow, "createdAt">): void {
     this.db
       .prepare(
-        `INSERT INTO runs (id, repo_path, branch, base_ref, design_path, design_hash,
+        `INSERT INTO runs (id, repo_path, branch, base_ref, base_spec, design_path, design_hash,
            config_json, state, approved, deny_list_json, stop_reason, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
-        row.id, row.repoPath, row.branch, row.baseRef, row.designPath, row.designHash,
+        row.id, row.repoPath, row.branch, row.baseRef, row.baseSpec, row.designPath, row.designHash,
         JSON.stringify(row.config), row.state, row.approved ? 1 : 0,
         JSON.stringify(row.denyList), row.stopReason, this.now(),
       );
@@ -205,6 +209,7 @@ export class Store {
       repoPath: r.repo_path as string,
       branch: r.branch as string,
       baseRef: r.base_ref as string,
+      baseSpec: (r.base_spec as string | null) ?? null,
       designPath: r.design_path as string,
       designHash: r.design_hash as string,
       config: JSON.parse(r.config_json as string) as RunConfig,
@@ -218,14 +223,17 @@ export class Store {
 
   /**
    * Find the most recent run for a (repo, design, base) triple. `build` uses
-   * this to resume an interrupted run instead of creating a duplicate.
+   * this to resume an interrupted run instead of creating a duplicate. `base`
+   * matches either the resolved SHA or the ref as originally given, so
+   * `--base origin/master` still finds its run after a fetch moves the ref.
    */
-  findRun(repoPath: string, designPath: string, baseRef: string): RunRow | null {
+  findRun(repoPath: string, designPath: string, base: string): RunRow | null {
     const r = this.db
       .prepare(
-        "SELECT id FROM runs WHERE repo_path = ? AND design_path = ? AND base_ref = ? ORDER BY created_at DESC LIMIT 1",
+        `SELECT id FROM runs WHERE repo_path = ? AND design_path = ? AND (base_ref = ? OR base_spec = ?)
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
       )
-      .get(repoPath, designPath, baseRef) as { id: string } | undefined;
+      .get(repoPath, designPath, base, base) as { id: string } | undefined;
     return r ? this.getRun(r.id) : null;
   }
 
@@ -257,12 +265,14 @@ export class Store {
   }
 
   // ---- Steps ----
-  insertSteps(runId: string, steps: PlanStep[]): void {
-    const stmt = this.db.prepare(
-      "INSERT INTO steps (run_id, id, ordinal, text, status, attempts) VALUES (?,?,?,?,?,0)",
-    );
+  /** Replace the run's plan (a re-approved design), keeping status/attempts as given. */
+  replaceSteps(runId: string, steps: (PlanStep & { attempts: number })[]): void {
     this.tx(() => {
-      for (const s of steps) stmt.run(runId, s.id, s.ordinal, s.text, s.status);
+      this.db.prepare("DELETE FROM steps WHERE run_id = ?").run(runId);
+      const stmt = this.db.prepare(
+        "INSERT INTO steps (run_id, id, ordinal, text, status, attempts) VALUES (?,?,?,?,?,?)",
+      );
+      for (const s of steps) stmt.run(runId, s.id, s.ordinal, s.text, s.status, s.attempts);
     });
   }
 
@@ -335,6 +345,13 @@ export class Store {
 
   consumeSession(rowId: number): void {
     this.db.prepare("UPDATE sessions SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL").run(this.now(), rowId);
+  }
+
+  /** Mark every ended-but-unprocessed session consumed, so none is ever replayed. */
+  consumeEndedSessions(runId: string): void {
+    this.db
+      .prepare("UPDATE sessions SET consumed_at = ? WHERE run_id = ? AND consumed_at IS NULL AND ended_at IS NOT NULL")
+      .run(this.now(), runId);
   }
 
   getSession(rowId: number): SessionRow | null {

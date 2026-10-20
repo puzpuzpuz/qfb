@@ -5,8 +5,9 @@ import { Store } from "../src/store.ts";
 import { Controller } from "../src/controller.ts";
 import { NullHerdrAdapter } from "../src/adapters/herdr.ts";
 import type { GitLike } from "../src/controller.ts";
+import { GitError } from "../src/git.ts";
 import type { PiAdapter, PiLaunchRequest, PiLaunchResult, SessionRef } from "../src/adapters/pi.ts";
-import type { GitSnapshot, TaskArtifact } from "../src/types.ts";
+import type { AddedContent, GitSnapshot, TaskArtifact, UnscannableFile } from "../src/types.ts";
 
 /** Mutable fake Git whose snapshot() reflects the current shared state. */
 export class FakeGit implements GitLike {
@@ -19,6 +20,12 @@ export class FakeGit implements GitLike {
     diffText: "",
     /** Test names that currently fail for real (e.g. tests exposing an open bug). */
     failing: [] as string[],
+    /** Changed files whose content cannot be scanned (binary, too large, ...). */
+    unscannable: [] as UnscannableFile[],
+    /** Refs that do not resolve; any diff against one fails like real git. */
+    missingRefs: [] as string[],
+    /** ref -> commit SHA; unlisted refs resolve to themselves. */
+    refs: {} as Record<string, string>,
   };
   commits: string[] = [];
   branch() {
@@ -27,7 +34,17 @@ export class FakeGit implements GitLike {
   head() {
     return this.state.head;
   }
-  snapshot(_base: string): GitSnapshot {
+  private checkRef(ref: string) {
+    if (this.state.missingRefs.includes(ref)) {
+      throw new GitError(["diff", ref], `fatal: bad revision '${ref}'`);
+    }
+  }
+  resolveCommit(ref: string) {
+    this.checkRef(ref);
+    return this.state.refs[ref] ?? ref;
+  }
+  snapshot(base: string): GitSnapshot {
+    this.checkRef(base);
     return {
       branch: this.state.branch,
       head: this.state.head,
@@ -36,8 +53,19 @@ export class FakeGit implements GitLike {
       untrackedFiles: [],
     };
   }
-  changedFiles(_base: string) {
+  changedFiles(base: string) {
+    this.checkRef(base);
     return this.state.changedFiles;
+  }
+  addedContent(base: string): AddedContent {
+    this.checkRef(base);
+    return {
+      files: [
+        ...this.state.changedFiles.map((path) => ({ path, added: "" })),
+        ...(this.state.diffText ? [{ path: "(diff)", added: this.state.diffText }] : []),
+      ],
+      unscannable: this.state.unscannable,
+    };
   }
   workingDiff(_base: string) {
     return this.state.diffText;
@@ -107,7 +135,12 @@ export class MockPi implements PiAdapter {
       transcriptPath: null,
     };
     const result = h ? { ...base, ...h(req, this.git) } : base;
-    if (result.artifact) writeFileSync(req.artifactPath, JSON.stringify(result.artifact));
+    if (result.artifact) {
+      // Like an agent following the prompt: identify the artifact with this session.
+      const a = result.artifact as TaskArtifact;
+      result.artifact = { ...a, runId: a.runId === AUTO ? req.runId : a.runId, stepId: a.stepId === AUTO ? req.stepId : a.stepId };
+      writeFileSync(req.artifactPath, JSON.stringify(result.artifact));
+    }
     this.running.delete(req.sessionId);
     return result;
   }
@@ -120,10 +153,13 @@ export class MockPi implements PiAdapter {
   }
 }
 
+/** Identity placeholder MockPi replaces with the launching session's run/step id. */
+export const AUTO = "<auto>";
+
 export function artifact(partial: Partial<TaskArtifact>): TaskArtifact {
   return {
-    runId: "r",
-    stepId: "s",
+    runId: AUTO,
+    stepId: AUTO,
     kind: "implementation",
     status: "DONE",
     summary: "did the thing",

@@ -34,12 +34,12 @@ Node process; there is no server, broker, or scheduler.
 | `src/stateMachine.ts` | The validated transition table. Invalid transitions throw. Orthogonal states (`paused`/`blocked`/`failed`/`reconciliation`) are reachable from any non-terminal state and exit back to the interrupted phase (`resumeTarget`). |
 | `src/store.ts` | `node:sqlite` transactional store: runs, steps, transitions, sessions (pid, outcome, consumption), checkpoints, reviews, counters, and atomic **exclusive locks** on the run and its checkout (pid+host, stale-takeover). |
 | `src/procs.ts` | Process groups: every Pi session and re-run test command leads its own group, so a timeout/stop kills the whole tree and strays are reaped on exit (no overlapping writers, no concurrent Maven). Also the default `sh -c` test runner. |
-| `src/plan.ts` | The preparation phase's normalizer. Extracts an ordered plan from a Markdown design/handoff doc via three strategies in priority order: `### Step N` heading-delimited steps, numbered lists, then checkboxes. Emits QFB's canonical manifest. Preserves wording; never invents or reorders; flags ambiguity for approval. |
-| `src/gating.ts` | Mechanical gate (Section 6.1): objective facts only — artifact validity, the controller's REAL test exit codes vs the claims, branch/HEAD/submodule identity, scope, confidentiality, orchestration-artifact hygiene. `writer` mode for code-changing sessions, `read-only` mode (tree must be unchanged) for identify/review. |
-| `src/confidentiality.ts` | Frozen deny-list matching with token variants (snake/kebab/camel/nospace), case-insensitive. A mechanical gate, never an inference. |
-| `src/report.ts` | Parses `review-pr`'s machine-readable ```qfb-review``` surface; **pauses on ambiguity** instead of guessing. Selects actionable findings by policy; computes acceptance. |
+| `src/plan.ts` | The preparation phase's normalizer. Extracts an ordered plan from a Markdown design/handoff doc via three strategies in priority order: `### Step N` heading-delimited steps, numbered lists, then checkboxes. Fence-aware (code blocks are opaque); keeps each step's full body. Emits QFB's canonical manifest. Preserves wording; never invents or reorders; flags ambiguity (several lists, numbering restarts, mixed list kinds) for explicit approval. |
+| `src/gating.ts` | Mechanical gate (Section 6.1): objective facts only — artifact validity and identity (run, step, kind, created after the session started), the controller's REAL test exit codes vs the claims, branch/HEAD/submodule identity, scope, confidentiality (failing closed on unscannable files), orchestration-artifact hygiene. `writer` mode for code-changing sessions, `read-only` mode (tree must be unchanged) for identify/review. |
+| `src/confidentiality.ts` | Frozen deny-list matching: both sides folded to lowercase letters and digits, then substring-matched, so case, separators, accents, and identifier embedding (`testTradeEventsOoo`) never hide a term. A mechanical gate, never an inference. |
+| `src/report.ts` | Parses `review-pr`'s machine-readable ```qfb-review``` surface (exactly one block, unique finding IDs); **pauses on ambiguity** instead of guessing. Selects actionable findings by policy; computes acceptance. |
 | `src/identity.ts` | One shared identity + no-progress mechanism, instantiated over review findings and hardening bug entries. |
-| `src/git.ts` | Read-mostly Git wrapper. Snapshots branch/HEAD/dirty-fingerprint/submodule/untracked. Checkpoint-commit only. **No destructive commands exist in the code.** |
+| `src/git.ts` | Read-mostly Git wrapper. Snapshots branch/HEAD/dirty-fingerprint/submodule/untracked; derives changed files and the content a change adds (for the confidentiality scan). Output is independent of user Git config, unbounded by buffer size in practice (1 GiB), and every failure throws `GitError`, which pauses the run: no fallback comparison is ever substituted. Checkpoint-commit only. **No destructive commands exist in the code.** |
 | `src/adapters/pi.ts` | `PiAdapter` interface + `RpcPiAdapter`. Launches a fresh session, returns structured lifecycle info and the **typed artifact** — the only trusted completion signal. |
 | `src/adapters/herdr.ts` | `HerdrAdapter` interface + `CliHerdrAdapter`/`NullHerdrAdapter`. Pane labels, observation (never trusted as completion), output collection. |
 | `src/doctor.ts` | Preflight checks (Pi/Herdr/git/sqlite/skills/execution mode). |
@@ -62,6 +62,9 @@ recoverable:
   transition that acts on its outcome. A crash before that point re-processes the outcome from the
   on-disk artifact (never relaunching the agent); after it, the outcome is never replayed — a
   resumed or retried phase always gets a fresh session id (`run-…-S1-a2`, `run-…-review-3`, …).
+  Two pauses deliberately keep the outcome unconsumed so that `resume` re-gates it instead of
+  relaunching the agent: a git failure while gathering evidence, and files awaiting an operator's
+  confidentiality vetting. Re-approving a changed design consumes any such held outcome.
 - **One writer.** Sessions record their pid (= process group). On restart, a session the previous
   controller never saw end is checked: alive → `reconciliation`, no second writer; gone → its
   partial work is preserved as evidence and the phase continues with an informed attempt. Locks

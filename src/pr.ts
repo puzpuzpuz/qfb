@@ -4,6 +4,8 @@ import type { GitLike, AcceptedCandidate } from "./controller.ts";
 
 export interface PrResult {
   opened: boolean;
+  /** The accepted commit was pushed (to a new or an already-open PR). */
+  pushed: boolean;
   url?: string;
   reason: string;
 }
@@ -45,56 +47,60 @@ export function pushBlocker(git: Pick<GitLike, "branch" | "head" | "isClean" | "
 }
 
 /**
- * Open a pull request for the feature branch if one is not already open.
+ * Push the accepted commit and open a pull request for the feature branch if
+ * one is not already open. An already-open PR still receives the push, so it
+ * never lags behind the commit the final review accepted.
  *
  * NOTE: spec Section 7 defaults QFB to never push or open PRs without separate
  * authorization. Invoking `qfb build` IS that explicit authorization for the
  * final, completed candidate only: this runs only after COMPLETED, pushes only
- * the exact commit the final review accepted, and refuses deny-listed PR text.
+ * the exact commit the final review accepted (never forced), and refuses
+ * deny-listed PR text.
  */
 export function openPrIfNone(repoPath: string, git: Pick<GitLike, "branch" | "head" | "isClean" | "snapshot">, req: PrRequest): PrResult {
   const leaks = scanForDenyTerms(`${req.title}\n${req.body}`, req.denyList);
   if (leaks.length > 0) {
     return {
       opened: false,
+      pushed: false,
       reason: `PR title/body contains deny-listed term(s) ${leaks.map((m) => `"${m.term}"`).join(", ")}; pass a neutral --pr-title`,
     };
   }
   const blocker = pushBlocker(git, req);
-  if (blocker) return { opened: false, reason: `not pushing: ${blocker}` };
+  if (blocker) return { opened: false, pushed: false, reason: `not pushing: ${blocker}` };
 
   const gh = (args: string[]): string =>
     execFileSync("gh", args, { cwd: repoPath, encoding: "utf8" });
+  const firstLine = (e: unknown) => (e as Error).message.split("\n")[0];
 
   try {
     execFileSync("gh", ["--version"], { stdio: "ignore" });
   } catch {
-    return { opened: false, reason: "gh CLI not found; skipped PR creation. Push and open the PR manually." };
+    return { opened: false, pushed: false, reason: "gh CLI not found; skipped PR creation. Push and open the PR manually." };
   }
 
-  // Already an open PR for this branch?
+  // Push the verified branch first: a new PR needs it, and an open one must not go stale.
+  try {
+    execFileSync("git", ["push", "-u", "origin", req.branch], { cwd: repoPath, stdio: "inherit" });
+  } catch (e) {
+    return { opened: false, pushed: false, reason: `git push failed: ${firstLine(e)}` };
+  }
+
   try {
     const existing = gh(["pr", "list", "--head", req.branch, "--state", "open", "--json", "url"]);
     const arr = JSON.parse(existing || "[]") as { url: string }[];
     if (arr.length > 0) {
-      return { opened: false, url: arr[0]!.url, reason: "an open PR already exists for this branch" };
+      return { opened: false, pushed: true, url: arr[0]!.url, reason: "pushed the accepted commit to the already-open PR" };
     }
   } catch (e) {
-    return { opened: false, reason: `could not query existing PRs: ${(e as Error).message.split("\n")[0]}` };
-  }
-
-  // Push the verified branch, then open the PR.
-  try {
-    execFileSync("git", ["push", "-u", "origin", req.branch], { cwd: repoPath, stdio: "inherit" });
-  } catch (e) {
-    return { opened: false, reason: `git push failed: ${(e as Error).message.split("\n")[0]}` };
+    return { opened: false, pushed: true, reason: `pushed, but could not query existing PRs: ${firstLine(e)}` };
   }
 
   try {
     const out = gh(["pr", "create", "--base", req.prBase, "--head", req.branch, "--title", req.title, "--body", req.body]);
     const url = out.trim().split("\n").filter(Boolean).pop() ?? "";
-    return { opened: true, url, reason: "opened a new PR" };
+    return { opened: true, pushed: true, url, reason: "opened a new PR" };
   } catch (e) {
-    return { opened: false, reason: `gh pr create failed: ${(e as Error).message.split("\n")[0]}` };
+    return { opened: false, pushed: true, reason: `pushed, but gh pr create failed: ${firstLine(e)}` };
   }
 }

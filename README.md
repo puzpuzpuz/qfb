@@ -77,6 +77,9 @@ What `qfb build` does, in order:
 2. **Derives** the feature base from `merge-base(HEAD, --pr-base)` unless you pass `--base`.
 3. **Prepares** the plan — normalizes the design/handoff doc into QFB's canonical manifest.
 4. **Approves** it — interactively (shows the manifest and prompts) or non-interactively with `--yes`.
+   `--yes` covers only a clear, first-time plan: an **ambiguous** plan mapping, or a design that
+   **changed after approval**, always needs a human (an interactive confirmation or `qfb approve`).
+   A plan with no extractable steps is never approved.
 5. **Orchestrates** serial implementation → hardening → review/fix → completion.
 6. **Opens a PR** for the branch if none is open (disable with `--no-pr`). It pushes only the exact
    commit the final review accepted, from a clean tree, and refuses PR text containing deny-listed
@@ -166,18 +169,20 @@ An agent's `DONE` is a **claim, not a result** — it is only an input to the ga
 |---------|---------|
 | `qfb build --repo PATH --design PATH [--base REF] [--pr-base BRANCH] [--yes] [--no-pr] [--pr-title …] [--skip-doctor] [--deny …] [--commit] [--strict] [--level N]` | **One-shot, resumable orchestration**: validate → prepare → approve → run → open PR. Re-run to resume. |
 | `qfb doctor [--repo PATH]` | Check Pi, Herdr, skills, subagents, credentials, execution-mode compatibility. |
-| `qfb init --repo PATH --design PATH --base REF [--deny a,b] [--commit] [--strict] [--level N]` | Create a run; extract + freeze the plan manifest. |
+| `qfb init --repo PATH --design PATH --base REF [--deny a,b] [--commit] [--strict] [--level N]` | Create a run; resolve `--base` to a commit SHA (the review range never drifts after a fetch); extract the plan manifest. |
 | `qfb plan RUN_ID` | Print the normalized plan manifest produced by the preparation phase. |
-| `qfb approve RUN_ID` | Approve the frozen design + plan (freezes the design hash). |
+| `qfb approve RUN_ID` | Approve the design + plan (freezes the design hash). If the design changed since the plan was extracted, it re-extracts, shows the step diff, and needs a second `approve`. Only for runs awaiting (re-)approval; it is not a resume. |
 | `qfb run RUN_ID` | Execute the workflow to its next natural stopping point. |
 | `qfb status RUN_ID` | Phase, step progress, session, Git state, blockers, review iteration. |
 | `qfb pause / resume / stop RUN_ID` | Safe pause (a live controller pauses after its current session), reconcile-and-continue back to the interrupted phase (a `failed` run gets an audited retry), forced stop (kills the session's process tree, preserves evidence, enters `reconciliation`). |
+| `qfb resume RUN_ID --accept-unscannable` | Record that you vetted the files the confidentiality scan could not read (binary, too large, unreadable); the vetting covers exactly that content. |
 | `qfb logs RUN_ID` | Locate transcripts, test logs, review/fix reports. |
 | `qfb list` | List known runs. |
 
 Flags: `--commit` (commit-checkpoint policy instead of snapshot-only), `--strict` (resolve all
-actionable findings, not just Critical), `--level N` (review level 0–3, default 2), `--deny` (the
-confidentiality deny-list).
+actionable findings, not just Critical), `--level N` (review level 0–3, default 2; anything else is
+rejected), `--deny` (the confidentiality deny-list; terms match regardless of case and separators,
+including inside identifiers: `trade_events` also catches `testTradeEventsOoo`).
 
 ## State & artifacts
 

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { makeHarness, artifact, THREE_STEP_DESIGN } from "./helpers.ts";
+import { PlanChangedError } from "../src/controller.ts";
 import type { Harness, PiHandler } from "./helpers.ts";
 import type { PiLaunchRequest } from "../src/adapters/pi.ts";
 
@@ -163,9 +164,19 @@ test("edited design document invalidates approval until reconciled", async () =>
   assert.equal(await h.controller.run(runId), "paused");
   assert.match(String(h.controller.status(runId).stopReason), /re-approval/);
   await assert.rejects(() => h.controller.resume(runId), /re-approval required/);
-  // Re-approve and the run can proceed again.
+  // Re-approval first re-extracts the plan: the new step is shown, not silently approved.
+  assert.throws(() => h.controller.approve(runId), (e: unknown) => {
+    assert.ok(e instanceof PlanChangedError);
+    assert.deepEqual(e.diff, ["  S1  Add the column reader.", "  S2  Wire up the WAL path.", "  S3  Add integration tests.", "+ S4  Sneaky extra step."]);
+    return true;
+  });
+  assert.equal(h.controller.status(runId).state, "paused");
+  // A second, deliberate approval accepts the reviewed plan, and the run can proceed again.
   h.controller.approve(runId);
   assert.equal(h.controller.status(runId).state, "READY");
+  assert.deepEqual(h.store.getSteps(runId).map((s) => s.text), [
+    "Add the column reader.", "Wire up the WAL path.", "Add integration tests.", "Sneaky extra step.",
+  ]);
 });
 
 test("blocking review triggers fix-pr then a fresh review that completes", async () => {
@@ -554,7 +565,7 @@ test("a crash after a session ended but before its outcome was recorded re-proce
   const before = h.git.snapshot("b");
   const row = h.store.recordSession(runId, "S1", "implementation", `${runId}-S1-a1`, null, path, before);
   h.git.state.fingerprint = "s1-done";
-  writeFileSync(path, JSON.stringify(artifact({ stepId: "S1" })));
+  writeFileSync(path, JSON.stringify(artifact({ runId, stepId: "S1" })));
   h.store.endSession(row, "DONE", 0, false); // ...then the controller died
   for (const x of happyTail()) h.pi.push(x);
 
@@ -706,4 +717,221 @@ test("commit policy refuses a dirty checkout at init", () => {
     () => h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b", config: { checkpointPolicy: "commit" } }),
     /requires a clean checkout/,
   );
+});
+
+// ------------------------------------------------------------------ H2 / F2: git evidence fails closed
+
+test("init anchors the base: the ref is resolved to a commit SHA, and the run is still found by the ref", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [...[implDone("S1")], ...happyTail()]);
+  h.git.state.refs = { "origin/master": "abc123" };
+  const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "origin/master" });
+  const run = h.store.getRun(runId)!;
+  assert.equal(run.baseRef, "abc123");
+  assert.equal(run.baseSpec, "origin/master");
+  assert.equal(h.store.findRun("/repo", h.designPath, "origin/master")?.id, runId);
+  assert.equal(h.store.findRun("/repo", h.designPath, "abc123")?.id, runId);
+  h.controller.approve(runId);
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  assert.match(h.pi.launches.find((l) => l.stepId === "review")!.prompt, /--range=abc123\.\./);
+});
+
+test("init refuses a base that does not resolve to a commit", () => {
+  const h = makeHarness(THREE_STEP_DESIGN, []);
+  h.git.state.missingRefs = ["origin/nope"];
+  assert.throws(
+    () => h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "origin/nope" }),
+    /Base "origin\/nope" does not resolve to a commit.*bad revision 'origin\/nope'/,
+  );
+});
+
+test("a git failure while gathering gate evidence pauses with the error; the outcome is re-gated after the fix", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    (req, git) => {
+      const r = implDone("S1")(req, git);
+      git.state.missingRefs = ["b"]; // e.g. the base commit became unreachable
+      return r;
+    },
+  ]);
+  const runId = start(h);
+  assert.equal(await h.controller.run(runId), "paused");
+  assert.match(String(h.controller.status(runId).stopReason), /Git failed.*bad revision 'b'.*qfb resume/);
+  assert.notEqual(h.store.getSteps(runId)[0]!.status, "done");
+
+  h.git.state.missingRefs = [];
+  for (const x of happyTail()) h.pi.push(x);
+  await h.controller.resume(runId);
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  assert.equal(h.pi.launches.filter((l) => l.stepId === "S1").length, 1, "S1's outcome was re-gated, not relaunched");
+});
+
+// ------------------------------------------------------------------ H1: unscannable files and the final check
+
+const PARQUET = { path: "fixture.parquet", reason: "binary", digest: "d1" };
+
+test("an unscannable file pauses for vetting; --accept-unscannable re-gates the same outcome", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    (req, git) => {
+      git.state.unscannable = [PARQUET];
+      return implDone("S1")(req, git);
+    },
+  ]);
+  const runId = start(h, {}, ["AcmeCorp"]);
+  assert.equal(await h.controller.run(runId), "paused");
+  const st = h.controller.status(runId);
+  assert.match(String(st.stopReason), /cannot be scanned for deny-listed terms: fixture\.parquet \(binary\).*--accept-unscannable/);
+  assert.deepEqual(st.unscannablePending, ["fixture.parquet"]);
+
+  // Resuming without a decision re-gates and pauses again; nothing is relaunched.
+  await h.controller.resume(runId);
+  assert.equal(await h.controller.run(runId), "paused");
+  assert.equal(h.pi.launches.length, 1);
+
+  for (const x of happyTail()) h.pi.push(x);
+  await h.controller.resume(runId, { acceptUnscannable: true });
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  assert.equal(h.pi.launches.filter((l) => l.stepId === "S1").length, 1);
+  assert.ok(h.store.getTransitions(runId).some((t) => /vettedUnscannable/.test(String(t.evidence))));
+});
+
+test("vetting covers exactly the content seen: a changed unscannable file must be vetted again", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    (req, git) => {
+      git.state.unscannable = [PARQUET];
+      return implDone("S1")(req, git);
+    },
+  ]);
+  const runId = start(h, {}, ["AcmeCorp"]);
+  assert.equal(await h.controller.run(runId), "paused");
+  h.pi.push((req, git) => {
+    git.state.unscannable = [{ ...PARQUET, digest: "d2" }]; // S2 rewrote the fixture
+    return implDone("S2")(req, git);
+  });
+  await h.controller.resume(runId, { acceptUnscannable: true });
+  assert.equal(await h.controller.run(runId), "paused");
+  assert.equal(h.store.getSteps(runId)[0]!.status, "done");
+  assert.match(String(h.controller.status(runId).stopReason), /Step S2: 1 changed file\(s\) cannot be scanned/);
+});
+
+test("the reviewed candidate gets a final confidentiality check (a leak resumed past fix-pr is still caught)", async () => {
+  const blocking = { verdict: "blocking", testGatePassed: true, findings: [{ id: "F1", severity: "critical", location: "A:1", evidence: "x" }] };
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING, review(blocking),
+    (_r, git) => { git.state.diffText = "+ // AcmeCorp"; git.state.fingerprint = "fixed"; return { artifact: artifact({ kind: "fix", fixOutcome: "Clean" }) }; },
+  ]);
+  const runId = start(h, {}, ["AcmeCorp"]);
+  assert.equal(await h.controller.run(runId), "paused");
+  // The operator resumes without removing the leak; resuming a fix goes straight to review.
+  h.pi.push(review(APPROVED));
+  assert.equal(await h.controller.resume(runId), "REVIEWING");
+  assert.equal(await h.controller.run(runId), "paused");
+  assert.match(String(h.controller.status(runId).stopReason), /Final confidentiality check of the reviewed candidate failed: .*"AcmeCorp"/);
+  assert.equal(h.controller.acceptedCandidate(runId), null);
+});
+
+// ------------------------------------------------------------------ H6: artifact identity
+
+test("an artifact that belongs to another step, or predates the session, is rejected with the reason", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    (_r, git) => { git.state.fingerprint = "a"; return { artifact: artifact({ stepId: "S2" }) }; },
+    (_r, git) => { git.state.fingerprint = "b"; return { artifact: artifact({ stepId: "S1", createdAt: "2020-01-01T00:00:00Z" }) }; },
+  ]);
+  const runId = start(h, { maxImplAttemptsPerStep: 2 });
+  assert.equal(await h.controller.run(runId), "failed");
+  const failures = h.store.getTransitions(runId).map((t) => String(t.evidence)).join("\n");
+  assert.match(failures, /stepId is \\"S2\\", expected \\"S1\\"/);
+  assert.match(String(h.controller.status(runId).stopReason), /predates the session start/);
+  assert.match(h.pi.launches[0]!.prompt, new RegExp(`runId:"${runId}", stepId:"S1", kind:"implementation"`));
+});
+
+// ------------------------------------------------------------------ H3 / F7: approval re-checks the plan
+
+test("approve refuses a plan with no steps, including on re-runs", () => {
+  const h = makeHarness("# Title\n\nJust prose, no plan.\n", []);
+  const res = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b" });
+  assert.equal(res.steps, 0);
+  assert.equal(res.ambiguous, true);
+  assert.throws(() => h.controller.approve(res.runId), /has no plan steps/);
+  assert.throws(() => h.controller.approve(res.runId), /has no plan steps/);
+  assert.equal(h.controller.status(res.runId).state, "AWAITING_APPROVAL");
+  // Once the design has a plan, approval shows it first, then accepts it.
+  writeFileSync(h.designPath, THREE_STEP_DESIGN);
+  assert.throws(() => h.controller.approve(res.runId), PlanChangedError);
+  h.controller.approve(res.runId);
+  assert.equal(h.controller.status(res.runId).state, "READY");
+  assert.equal(h.controller.status(res.runId).stepsTotal, 3);
+});
+
+test("an ambiguous plan is flagged on the run and stays approvable by an explicit approve", () => {
+  const h = makeHarness("## Implementation Plan\n\n1. A.\n2. B.\n\nAcceptance criteria:\n\n1. A works.\n", []);
+  const res = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b" });
+  assert.equal(res.ambiguous, true);
+  assert.equal(h.controller.status(res.runId).planAmbiguous, true);
+  assert.equal(h.controller.refreshPlan(res.runId).ambiguous, true);
+  h.controller.approve(res.runId);
+  assert.equal(h.controller.status(res.runId).state, "READY");
+});
+
+test("re-approving an edited design keeps finished steps, gives edited steps fresh ids, and runs them", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    implDone("S1"),
+    () => ({ artifact: artifact({ stepId: "S2", status: "NEEDS_DECISION", summary: "fsync or not?" }) }),
+  ]);
+  const runId = start(h);
+  assert.equal(await h.controller.run(runId), "paused");
+  writeFileSync(h.designPath, THREE_STEP_DESIGN.replace("Wire up the WAL path.", "Wire up the WAL path with fsync."));
+  await assert.rejects(() => h.controller.resume(runId), /re-approval required/);
+  assert.throws(() => h.controller.approve(runId), (e: unknown) => {
+    assert.ok(e instanceof PlanChangedError);
+    assert.deepEqual(e.diff, [
+      "  S1  Add the column reader.", "+ S4  Wire up the WAL path with fsync.", "  S3  Add integration tests.", "- S2  Wire up the WAL path.",
+    ]);
+    return true;
+  });
+  h.controller.approve(runId);
+  assert.deepEqual(h.store.getSteps(runId).map((s) => [s.id, s.status]), [["S1", "done"], ["S4", "pending"], ["S3", "pending"]]);
+  h.pi.push(implDone("S4")); h.pi.push(implDone("S3"));
+  for (const x of HAPPY_HARDENING) h.pi.push(x);
+  h.pi.push(review(APPROVED));
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  assert.deepEqual(h.pi.launches.filter((l) => /^S\d$/.test(l.stepId)).map((l) => l.stepId), ["S1", "S2", "S4", "S3"]);
+});
+
+test("a step added while the run was reviewing is implemented before the run continues", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING,
+    review({ verdict: "needs-discussion", testGatePassed: true, findings: [] }),
+  ]);
+  const runId = start(h);
+  assert.equal(await h.controller.run(runId), "paused");
+  writeFileSync(h.designPath, THREE_STEP_DESIGN + "4. Document the WAL path.\n");
+  await assert.rejects(() => h.controller.resume(runId), /re-approval/);
+  assert.throws(() => h.controller.approve(runId), PlanChangedError);
+  h.controller.approve(runId);
+  assert.equal(h.controller.status(runId).state, "IMPLEMENTING");
+  h.pi.push(implDone("S4"));
+  for (const x of HAPPY_HARDENING) h.pi.push(x);
+  h.pi.push(review(APPROVED));
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  assert.ok(h.pi.launches.some((l) => l.stepId === "S4"));
+});
+
+test("approve is not a resume: it refuses a run paused for anything but a design change", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    () => ({ artifact: artifact({ stepId: "S1", status: "NEEDS_DECISION", summary: "which codec?" }) }),
+  ]);
+  const runId = start(h);
+  assert.equal(await h.controller.run(runId), "paused");
+  assert.throws(() => h.controller.approve(runId), /not awaiting approval \(state=paused\)\. To continue it, use 'qfb resume/);
+  // ...and --accept-unscannable needs something to accept.
+  await assert.rejects(() => h.controller.resume(runId, { acceptUnscannable: true }), /no unscannable files awaiting a decision/);
+});
+
+test("init validates configuration and the deny-list", () => {
+  const h = makeHarness(THREE_STEP_DESIGN, []);
+  const init = (o: Record<string, unknown>) =>
+    h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b", ...o } as never);
+  assert.throws(() => init({ config: { reviewLevel: NaN } }), /reviewLevel must be 0, 1, 2 or 3/);
+  assert.throws(() => init({ config: { maxReviewIterations: 0 } }), /maxReviewIterations must be an integer >= 1/);
+  assert.throws(() => init({ denyList: ["--"] }), /has no letters or digits/);
+  assert.ok(init({ denyList: ["HP"] }).notes.some((n: string) => /very short/.test(n)));
 });

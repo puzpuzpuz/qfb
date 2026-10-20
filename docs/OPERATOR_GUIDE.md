@@ -27,7 +27,9 @@ reason; fix the issue, run `qfb resume RUN_ID`, and re-run `build`.
 
 Without `--yes`, `build` shows the normalized manifest and prompts for approval
 interactively; on a non-TTY it stops at the approval gate and tells you to pass
-`--yes` or run `qfb approve`. The sections below describe the same lifecycle via
+`--yes` or run `qfb approve`. `--yes` never covers an **ambiguous** plan or a
+design **edited after approval**: those always need a human (the interactive
+prompt, or `qfb approve`). The sections below describe the same lifecycle via
 the granular commands, which `build` orchestrates.
 
 
@@ -51,11 +53,19 @@ implementation plan** under an "Implementation Plan" heading, in any of these sh
 - **`### Step N — …` heading-delimited steps** (each step is a sub-heading plus its body).
 
 During the **preparation phase** (`qfb init`), QFB reads the doc and normalizes it into its own
-canonical manifest: it assigns stable IDs (`S1`, `S2`, …), preserves the original wording verbatim,
-and keeps the order unchanged. It never invents or reorders steps; if the structure is ambiguous it
-tells you and asks you to adjust the design and re-init. Inspect the normalized manifest with
-`qfb plan RUN_ID` before approving. The manifest lives only in QFB's artifact store, never in the
-QuestDB checkout.
+canonical manifest: it assigns stable IDs (`S1`, `S2`, …), preserves each step's full wording
+verbatim (continuation lines, nested lists, and code blocks included), and keeps the order
+unchanged. Fenced code is opaque: a `# comment` in a bash snippet is not a heading, and a `1.` in a
+code block is not a step. Inspect the normalized manifest with `qfb plan RUN_ID` before approving.
+The manifest lives only in QFB's artifact store, never in the QuestDB checkout.
+
+QFB never invents or reorders steps. When the structure admits more than one reading, it still
+proposes a mapping but marks the plan **ambiguous** (with a note saying why), and the plan then
+needs an explicit human approval. That happens when the plan region holds several lists (say, an
+"Acceptance criteria" list after the steps), when numbering restarts or repeats, or when numbered
+items and checkboxes are mixed. A later list that continues the numbering (`3.` after `2.`) counts
+as the same plan. Either approve the proposed mapping, or move the extra list out of the
+"Implementation Plan" section and approve again.
 
 See [`../examples/sample-design.md`](../examples/sample-design.md).
 
@@ -70,11 +80,16 @@ qfb init --repo /path/to/questdb \
 ```
 
 - `--base` anchors the **review range** for the whole run; it is never narrowed to the last
-  checkpoint.
+  checkpoint. QFB resolves it to a commit SHA at init, so a later `git fetch` cannot move the range;
+  a base that does not resolve is refused.
 - `--deny` is the **confidentiality deny-list** (Section 7.1): customer/prospect/individual names and
   customer-specific table/column/schema names that must never appear in committed code, tests,
-  comments, or identifiers. It lives only in QFB's state store. Any match in a changeset fails the
-  scope/integrity gate and pauses the run.
+  comments, or identifiers. It lives only in QFB's state store. Matching ignores case, separators,
+  and accents, and finds a term anywhere, including inside identifiers: `trade_events` catches
+  `TRADE_EVENTS`, `trade-events`, `testTradeEventsOoo`, and `test_trade_events_wal`. Only what a
+  change **adds** is scanned (added lines, new files, new file names), so a pre-existing occurrence
+  that a change deletes or merely sits next to never pauses the run. Any match pauses the run. Very
+  short terms match a lot of unrelated code; `init` warns about them.
 - `--commit` switches checkpoints from snapshot-only to real commits: after every gated writer
   session (implementation step, hardening write/fix, fix-pr) QFB commits the verified tree. It
   requires a clean checkout at init (so nothing inherited is swept in), keeps deny-listed terms out
@@ -90,9 +105,18 @@ qfb status run-xxxxxxxx     # inspect the extracted steps
 qfb approve run-xxxxxxxx    # freezes the design hash + plan manifest
 ```
 
-Approval is explicit and authoritative. If you edit the design **after** approval, QFB detects the
-hash change on the next `run`/`resume`, enters `paused`, and requires a fresh `approve` (re-approval)
-before any implementation/hardening/review work may proceed.
+Approval is explicit and authoritative. A plan with no extractable steps is never approved. If you
+edit the design **after** approval, QFB detects the hash change on the next `run`/`resume`, enters
+`paused`, and requires a fresh `approve` (re-approval) before any implementation/hardening/review
+work may proceed.
+
+`approve` always approves the design as it is on disk, together with the steps extracted from
+that exact text. If the design changed since the plan was prepared and its steps changed, `approve`
+re-extracts them, prints the step diff (`+` new, `-` removed), stores the new manifest, and stops:
+review it with `qfb plan`, then run `approve` again. Steps whose text is unchanged keep their
+progress. New or edited steps get fresh IDs and run next, even if the run had already moved on to
+hardening or review. `approve` is only for runs awaiting approval or paused by a design change;
+to continue any other paused run, use `qfb resume`.
 
 ## 4. Run
 
@@ -149,6 +173,17 @@ When paused for a decision, `status` shows the `stopReason`. Inspect and, if nee
 checkout yourself, then `resume`. QFB never auto-approves permission dialogs, broad scope increases,
 or destructive Git actions.
 
+**Files the confidentiality scan cannot read.** A changed file that is binary, larger than 64 MiB,
+or unreadable cannot be checked against the deny-list, so the gate fails closed: the run pauses and
+names the file (`status` lists them under `unscannablePending`). Check them by hand. If they are
+clean, `qfb resume RUN_ID --accept-unscannable` records your decision against each file's content
+digest; the same session result is then re-checked, not redone. A later change to such a file
+needs vetting again. If a file should not be there, remove it and `qfb resume RUN_ID`.
+
+**Git failures.** If a git command fails while QFB gathers evidence (for example, the base commit is
+unreachable), the run pauses with git's error instead of judging the work on partial evidence. Fix
+the cause and `resume`; the interrupted session's result is re-checked, not redone.
+
 ## 7. Recovery after a crash
 
 Just run `qfb run RUN_ID` (or re-run `build`). The controller re-acquires the lock, re-reads
@@ -178,11 +213,20 @@ QFB terminates the session it launched before exiting. Retry budgets persist acr
   reached → failed; `qfb resume` grants an audited retry.
 - The **same blocker/bug identity** survived remediation without progress → failed, evidence preserved.
 - A **scope/integrity/confidentiality** violation (out-of-scope file, deny-listed name, orchestration
-  artifact, HEAD/branch/submodule moved, a read-only stage that modified the tree) → paused.
+  artifact, HEAD/branch/submodule moved, a read-only stage that modified the tree) → paused. The
+  reviewed candidate gets one more confidentiality check before the run completes.
+- A changed file the confidentiality scan **cannot read**, or a **git command failed** → paused
+  (see §6).
+- An artifact that does not belong to its session (wrong `runId`, `stepId`, or `kind`, or a
+  `createdAt` before the session started) → treated as no artifact, with the reason recorded.
+- A review report with **zero or several** `qfb-review` blocks, or duplicate finding IDs → paused
+  as ambiguous.
 - A session from an earlier controller is **still running** → reconciliation.
 
 ## Completion
 
 On `COMPLETED`, `qfb status` reflects completed steps and review history; `qfb logs` points at the
 full evidence. `qfb run` **does not** push, open/merge PRs, or deploy — that remains your decision.
-`qfb build` (unless `--no-pr`) pushes the accepted commit and opens a PR, nothing else.
+`qfb build` (unless `--no-pr`) pushes the accepted commit and opens a PR, nothing else. If a PR is
+already open for the branch, it still pushes the accepted commit (never forced), so the PR is not
+left behind.

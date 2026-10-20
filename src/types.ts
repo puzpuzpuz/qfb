@@ -120,6 +120,48 @@ export const DEFAULT_CONFIG: RunConfig = {
   backend: "rpc",
 };
 
+/** Minimum value of each numeric setting (all must be integers). */
+const NUMERIC_MIN: Record<string, number> = {
+  maxImplAttemptsPerStep: 1,
+  maxReviewIterations: 1,
+  maxInfraRetries: 0,
+  maxHardeningGapPasses: 1,
+  maxHardeningTestAttempts: 1,
+  maxHardeningFixIterations: 1,
+  // "The same identity survived N consecutive attempts": N = 1 would stop on the first finding.
+  maxNoProgress: 2,
+  maxTotalSessions: 1,
+  sessionInactivityTimeoutMs: 1000,
+  testTimeoutMs: 1000,
+};
+
+/** Reject unknown keys and out-of-range values instead of letting NaN or 0 silently disable a budget. */
+export function validateConfig(config: Record<string, unknown>): asserts config is Record<string, unknown> & RunConfig {
+  const errors: string[] = [];
+  for (const key of Object.keys(config)) {
+    if (!(key in DEFAULT_CONFIG)) errors.push(`unknown setting "${key}"`);
+  }
+  for (const [key, min] of Object.entries(NUMERIC_MIN)) {
+    const v = config[key];
+    if (typeof v !== "number" || !Number.isInteger(v) || v < min) {
+      errors.push(`${key} must be an integer >= ${min} (got ${JSON.stringify(v)})`);
+    }
+  }
+  if (![0, 1, 2, 3].includes(config.reviewLevel as number)) {
+    errors.push(`reviewLevel must be 0, 1, 2 or 3 (got ${JSON.stringify(config.reviewLevel)})`);
+  }
+  if (config.checkpointPolicy !== "snapshot" && config.checkpointPolicy !== "commit") {
+    errors.push(`checkpointPolicy must be "snapshot" or "commit" (got ${JSON.stringify(config.checkpointPolicy)})`);
+  }
+  if (typeof config.strictReviewPolicy !== "boolean") {
+    errors.push(`strictReviewPolicy must be a boolean (got ${JSON.stringify(config.strictReviewPolicy)})`);
+  }
+  if (config.backend !== "rpc" && config.backend !== "herdr") {
+    errors.push(`backend must be "rpc" or "herdr" (got ${JSON.stringify(config.backend)})`);
+  }
+  if (errors.length > 0) throw new Error(`Invalid run configuration: ${errors.join("; ")}.`);
+}
+
 export interface GitSnapshot {
   branch: string;
   head: string;
@@ -127,6 +169,26 @@ export interface GitSnapshot {
   dirtyFingerprint: string;
   submoduleHead: string | null;
   untrackedFiles: string[];
+}
+
+/** A changed file whose content the confidentiality scan cannot read; the gate fails closed on it. */
+export interface UnscannableFile {
+  path: string;
+  /** Why it could not be scanned, e.g. "binary" or "too large (80 MiB)". */
+  reason: string;
+  /** Content digest, so an operator's "vetted" decision covers exactly this content. */
+  digest: string;
+}
+
+/**
+ * What the confidentiality gate scans: only content the change ADDS versus the
+ * feature base. Removed and unchanged lines are excluded, so a pre-existing
+ * occurrence that the change deletes or merely surrounds never pauses the run.
+ */
+export interface AddedContent {
+  /** Every added/modified tracked path and every untracked file, with the text the change adds to it. */
+  files: { path: string; added: string }[];
+  unscannable: UnscannableFile[];
 }
 
 /** Typed handoff artifact every session must emit on disk (Section 6). */

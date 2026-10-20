@@ -8,27 +8,46 @@ import type { RunRow, SessionRow } from "./store.ts";
 import type { PaneLabel } from "./adapters/herdr.ts";
 import type { PiLaunchResult, SessionRef } from "./adapters/pi.ts";
 import { assertTransition, isActive, isOrthogonal, resumeTarget } from "./stateMachine.ts";
-import { extractPlan } from "./plan.ts";
-import { mechanicalGate, validateArtifact } from "./gating.ts";
+import { extractPlan, renderManifest } from "./plan.ts";
+import { checkArtifact, confidentialityFailures, mechanicalGate } from "./gating.ts";
+import type { ExpectedArtifact } from "./gating.ts";
 import { parseReviewReport, selectActionableFindings, isAcceptable, AmbiguousReportError } from "./report.ts";
 import { findingIdentity, bugIdentity, detectNoProgress } from "./identity.ts";
-import { scanForDenyTerms } from "./confidentiality.ts";
-import { Git } from "./git.ts";
+import { foldForMatch, scanForDenyTerms } from "./confidentiality.ts";
+import { Git, GitError } from "./git.ts";
 import { shellTestRunner } from "./procs.ts";
 import type { TestRunner } from "./procs.ts";
-import { State, AgentStatus, FixOutcome, DEFAULT_CONFIG } from "./types.ts";
+import { State, AgentStatus, FixOutcome, DEFAULT_CONFIG, validateConfig } from "./types.ts";
 import type { PiAdapter } from "./adapters/pi.ts";
 import type { HerdrAdapter } from "./adapters/herdr.ts";
-import type { RunConfig, StateName, TaskArtifact, GitSnapshot, VerifiedTest, ReviewReport } from "./types.ts";
+import type {
+  AddedContent,
+  GitSnapshot,
+  PlanStep,
+  ReviewReport,
+  RunConfig,
+  StateName,
+  TaskArtifact,
+  UnscannableFile,
+  VerifiedTest,
+} from "./types.ts";
 
-/** Minimal Git surface the controller depends on (injectable for tests). */
+/**
+ * Minimal Git surface the controller depends on (injectable for tests). Every
+ * method that feeds a gate throws GitError on failure; the controller pauses
+ * instead of substituting a fallback.
+ */
 export interface GitLike {
   branch(): string;
   head(): string;
+  /** The commit SHA `ref` names; throws when it does not resolve to a commit. */
+  resolveCommit(ref: string): string;
   snapshot(base: string): GitSnapshot;
-  /** Git-derived list of paths changed vs base (tracked + untracked). */
+  /** Git-derived list of paths changed vs base (tracked incl. deletions, plus untracked). */
   changedFiles(base: string): string[];
-  /** Git-derived diff content vs base (tracked diff + untracked contents). */
+  /** Git-derived content the change adds vs base, for the confidentiality scan. */
+  addedContent(base: string): AddedContent;
+  /** Human-readable diff vs base plus untracked contents (evidence only, never gated on). */
   workingDiff(base: string): string;
   isClean(): boolean;
   /** Commit the (already gated) working tree; returns the new HEAD. */
@@ -55,6 +74,7 @@ export interface ControllerDeps {
 export interface InitOptions {
   repoPath: string;
   designPath: string;
+  /** Feature base as a ref or SHA; resolved to a commit SHA at init. */
   base: string;
   config?: Partial<RunConfig>;
   denyList?: string[];
@@ -67,12 +87,41 @@ export interface AcceptedCandidate {
   fingerprint: string;
 }
 
+/** The plan as currently prepared for approval. */
+export interface PlanInfo {
+  /** True when this call re-extracted the plan and the steps changed. */
+  changed: boolean;
+  /** Step diff against the previous plan (`+` new, `-` removed, blank kept); empty when unchanged. */
+  diff: string[];
+  steps: number;
+  ambiguous: boolean;
+  notes: string[];
+  strategy: string;
+  preparedPlanPath: string;
+}
+
+/**
+ * `approve` found that the design changed since the manifest was prepared and
+ * re-extracted different steps. The new plan is stored; approving it needs a
+ * second, deliberate `approve` after the operator has seen the diff.
+ */
+export class PlanChangedError extends Error {
+  readonly diff: string[];
+  constructor(runId: string, diff: string[]) {
+    super(
+      `The design changed since the plan was prepared, and its steps changed. Review the updated manifest ` +
+        `('qfb plan ${runId}'), then run 'qfb approve ${runId}' again to approve it.`,
+    );
+    this.diff = diff;
+  }
+}
+
 export class PauseSignal extends Error {}
 /** Unwinds the run loop after the controller already persisted a stop/reconciliation. */
 class HaltSignal extends Error {}
 
 const STOP_STATES: StateName[] = [State.COMPLETED, State.FAILED, State.PAUSED, State.BLOCKED, State.RECONCILIATION];
-const DESIGN_CHANGED = "Approved design changed after approval; re-approval required.";
+export const DESIGN_CHANGED = "Approved design changed after approval; re-approval required.";
 
 // Counter keys.
 const PAUSE_REQUEST = "request-pause";
@@ -80,11 +129,33 @@ const STOP_REQUEST = "request-stop";
 /** Highest session row id at the last operator retry of a FAILED run; budgets count sessions after it. */
 const BUDGET_EPOCH = "budget-epoch";
 const ACCEPTED = "accepted-candidate";
+/** Hash of the design text the stored steps were extracted from. */
+const PLAN_SOURCE_HASH = "plan-source-hash";
+/** JSON notes explaining why the stored plan is ambiguous; absent when it is not. */
+const PLAN_AMBIGUOUS = "plan-ambiguous";
+/** Files the last gate could not scan, awaiting an operator's decision. */
+const UNSCANNABLE_PENDING = "unscannable-pending";
+/** Files (path + content digest) an operator vetted by hand; the scan skips exactly these. */
+const UNSCANNABLE_ACCEPTED = "unscannable-accepted";
+
+/** The artifact `kind` each session kind must write. */
+const ARTIFACT_KIND: Record<string, TaskArtifact["kind"]> = {
+  implementation: "implementation",
+  "hardening-identify": "coverage-gap",
+  "hardening-write": "bug",
+  "hardening-fix": "bug",
+  review: "review",
+  fix: "fix",
+};
+
+const NO_CONTENT: AddedContent = { files: [], unscannable: [] };
 
 interface Obtained {
   result: PiLaunchResult;
   row: SessionRow;
   before: GitSnapshot;
+  /** Why the artifact was rejected (shape or identity), when it was. */
+  problem: string | null;
 }
 
 export class Controller {
@@ -131,10 +202,27 @@ export class Controller {
     const runId = `run-${randomUUID().slice(0, 8)}`;
     const design = readFileSync(opts.designPath, "utf8");
     const designHash = sha256(design);
-    const extraction = extractPlan(design);
+
+    const config = { ...DEFAULT_CONFIG, ...opts.config };
+    validateConfig(config);
+    const denyList = opts.denyList ?? [];
+    const notes: string[] = [];
+    for (const term of denyList) {
+      const folded = foldForMatch(term);
+      if (!folded) throw new Error(`Deny-list term ${JSON.stringify(term)} has no letters or digits, so it cannot be matched.`);
+      if (folded.length < 3) {
+        notes.push(`Deny-list term ${JSON.stringify(term)} is very short; substring matching will flag unrelated identifiers too.`);
+      }
+    }
 
     const git = this.makeGit(opts.repoPath);
-    const config: RunConfig = { ...DEFAULT_CONFIG, ...opts.config };
+    // Anchor the review range: a ref such as origin/master moves on the next fetch.
+    let baseSha: string;
+    try {
+      baseSha = git.resolveCommit(opts.base);
+    } catch (e) {
+      throw new Error(`Base ${JSON.stringify(opts.base)} does not resolve to a commit in ${opts.repoPath}: ${(e as Error).message}`);
+    }
     if (config.checkpointPolicy === "commit" && !git.isClean()) {
       // Commit checkpoints stage the whole gated tree; inherited changes would be swept in.
       throw new Error(
@@ -147,60 +235,177 @@ export class Controller {
       id: runId,
       repoPath: opts.repoPath,
       branch: git.branch(),
-      baseRef: opts.base,
+      baseRef: baseSha,
+      baseSpec: opts.base,
       designPath: opts.designPath,
       designHash,
       config,
       state: State.CREATED,
       approved: false,
-      denyList: opts.denyList ?? [],
+      denyList,
       stopReason: null,
     });
     this.store.recordTransition(runId, null, State.CREATED, "init");
 
     // --- Preparation phase ---
     this.transition(runId, State.CREATED, State.PREPARING, "prepare");
-    const preparedPlanPath = this.artifactPath(runId, "prepared-plan.md");
-    const header =
-      `<!-- QFB prepared plan for ${runId} -->\n` +
-      `<!-- source design/handoff: ${opts.designPath} -->\n` +
-      `<!-- approve with: qfb approve ${runId} -->\n\n`;
-    writeFileSync(preparedPlanPath, header + extraction.normalizedMarkdown);
-    this.store.setCounter(runId, "prepared-plan-path", preparedPlanPath);
-    this.store.setCounter(runId, "plan-strategy", extraction.strategy);
-    this.store.insertSteps(runId, extraction.steps);
-
+    const plan = this.replan(this.requireRun(runId), design, designHash);
     this.transition(runId, State.PREPARING, State.AWAITING_APPROVAL, "prepared",
-      JSON.stringify({ strategy: extraction.strategy, steps: extraction.steps.length }));
+      JSON.stringify({ strategy: plan.strategy, steps: plan.steps, ambiguous: plan.ambiguous }));
 
     return {
       runId,
-      ambiguous: extraction.ambiguous,
-      notes: extraction.notes,
-      steps: extraction.steps.length,
-      strategy: extraction.strategy,
-      preparedPlanPath,
+      ambiguous: plan.ambiguous,
+      notes: [...plan.notes, ...notes],
+      steps: plan.steps,
+      strategy: plan.strategy,
+      preparedPlanPath: plan.preparedPlanPath,
     };
   }
 
-  /** Approve (or re-approve after a design change) and freeze the design hash. */
+  /**
+   * Bring the prepared plan up to date with the design on disk before approval:
+   * when the design changed since the steps were extracted, re-extract them
+   * (see replan). Only valid while the run awaits (re-)approval.
+   */
+  refreshPlan(runId: string): PlanInfo {
+    return this.withRunLock(runId, () => {
+      const run = this.requireRun(runId);
+      this.assertApprovable(run);
+      const design = readFileSync(run.designPath, "utf8");
+      const hash = sha256(design);
+      if (hash !== this.store.getCounter(runId, PLAN_SOURCE_HASH)) return this.replan(run, design, hash);
+      return this.planInfo(runId);
+    });
+  }
+
+  /**
+   * Approve (or re-approve after a design change) and freeze the design hash.
+   * The approved hash and the steps always describe the same design text: if
+   * the design changed since the steps were extracted, they are re-extracted
+   * first, and a changed plan must be reviewed and approved in a second call.
+   * A plan with no steps is never approved.
+   */
   approve(runId: string): void {
     this.withRunLock(runId, () => {
       const run = this.requireRun(runId);
-      if (run.state !== State.AWAITING_APPROVAL && run.state !== State.PAUSED) {
-        throw new Error(`Run ${runId} is not awaiting approval (state=${run.state}).`);
+      this.assertApprovable(run);
+      const design = readFileSync(run.designPath, "utf8");
+      const hash = sha256(design);
+      const noSteps = () =>
+        new Error(
+          `Run ${runId} has no plan steps: none could be extracted from ${run.designPath}. ` +
+            `Give it an ordered Implementation Plan, then approve again.`,
+        );
+      if (hash !== this.store.getCounter(runId, PLAN_SOURCE_HASH)) {
+        const plan = this.replan(run, design, hash);
+        if (plan.steps === 0) throw noSteps();
+        if (plan.changed) throw new PlanChangedError(runId, plan.diff);
       }
-      const hash = sha256(readFileSync(run.designPath, "utf8"));
+      if (this.store.getSteps(runId).length === 0) throw noSteps();
       this.store.tx(() => {
         this.store.setDesignHash(runId, hash);
         this.store.setApproved(runId);
         this.store.setStopReason(runId, null);
         this.reopenSteps(runId);
-        // Re-approval returns to the interrupted phase, not to the start.
-        const to = run.state === State.PAUSED ? this.resumeStateOf(runId) : State.READY;
+        // A held session outcome belongs to the previous plan: never re-process it.
+        this.store.consumeEndedSessions(runId);
+        // Re-approval returns to the interrupted phase, not to the start, unless
+        // the new plan has unimplemented steps: those come first.
+        let to: StateName = run.state === State.PAUSED ? this.resumeStateOf(runId) : State.READY;
+        const unfinished = this.store.getSteps(runId).some((s) => s.status !== "done");
+        if (unfinished && to !== State.READY) to = State.IMPLEMENTING;
         this.transition(runId, run.state, to, "approve");
       });
     });
+  }
+
+  /** approve/refreshPlan apply only to a run awaiting approval or paused by a design change. */
+  private assertApprovable(run: RunRow): void {
+    if (run.state === State.AWAITING_APPROVAL) return;
+    if (run.state === State.PAUSED && run.stopReason === DESIGN_CHANGED) return;
+    const hint =
+      isOrthogonal(run.state) && this.designChanged(run.id)
+        ? ` Its design changed: 'qfb resume ${run.id}' reconciles that and asks for re-approval.`
+        : isOrthogonal(run.state)
+          ? ` To continue it, use 'qfb resume ${run.id}'.`
+          : "";
+    throw new Error(`Run ${run.id} is not awaiting approval (state=${run.state}).${hint}`);
+  }
+
+  /**
+   * Extract the plan from `design` and store it with its source hash. Steps
+   * whose text is unchanged keep their id, status and attempts; new or edited
+   * steps get fresh ids (never reused, so no earlier session or budget is
+   * attributed to them) and start pending; removed steps are dropped. A design
+   * that yields no steps is not stored, so earlier progress is never lost.
+   */
+  private replan(run: RunRow, design: string, hash: string): PlanInfo {
+    const ex = extractPlan(design);
+    const runId = run.id;
+    const preparedPlanPath = this.artifactPath(runId, "prepared-plan.md");
+    const header =
+      `<!-- QFB prepared plan for ${runId} -->\n` +
+      `<!-- source design/handoff: ${run.designPath} (sha256 ${hash}) -->\n` +
+      `<!-- approve with: qfb approve ${runId} -->\n\n`;
+    const old = this.store.getSteps(runId);
+    if (ex.steps.length === 0) {
+      if (old.length === 0) {
+        // Nothing to lose: show the operator why nothing was extracted.
+        writeFileSync(preparedPlanPath, header + renderManifest([], ex.notes));
+        this.store.setCounter(runId, "prepared-plan-path", preparedPlanPath);
+        this.store.setCounter(runId, "plan-strategy", ex.strategy);
+      }
+      return { changed: false, diff: [], steps: 0, ambiguous: true, notes: ex.notes, strategy: ex.strategy, preparedPlanPath };
+    }
+
+    const fresh = this.store.getSessionCount(runId) === 0;
+    let nextId = old.reduce((m, s) => Math.max(m, Number(s.id.replace(/^S/, "")) || 0), 0) + 1;
+    const used = new Set<string>();
+    const diff: string[] = [];
+    const merged: (PlanStep & { attempts: number })[] = ex.steps.map((s, i) => {
+      const keep = old.find((o) => !used.has(o.id) && o.text === s.text);
+      if (keep) used.add(keep.id);
+      const id = fresh ? `S${i + 1}` : keep?.id ?? `S${nextId++}`;
+      diff.push(`${keep ? " " : "+"} ${id}  ${firstLine(s.text)}`);
+      return keep && !fresh
+        ? { ...keep, ordinal: i + 1 }
+        : { id, ordinal: i + 1, text: s.text, status: "pending", attempts: 0 };
+    });
+    for (const o of old) if (!used.has(o.id)) diff.push(`- ${o.id}  ${firstLine(o.text)}`);
+    const changed = JSON.stringify(old.map((s) => [s.id, s.text])) !== JSON.stringify(merged.map((s) => [s.id, s.text]));
+
+    this.store.tx(() => {
+      if (changed) this.store.replaceSteps(runId, merged);
+      this.store.setCounter(runId, "prepared-plan-path", preparedPlanPath);
+      this.store.setCounter(runId, "plan-strategy", ex.strategy);
+      this.store.setCounter(runId, PLAN_SOURCE_HASH, hash);
+      if (ex.ambiguous) this.store.setCounter(runId, PLAN_AMBIGUOUS, JSON.stringify(ex.notes));
+      else this.store.deleteCounter(runId, PLAN_AMBIGUOUS);
+      writeFileSync(preparedPlanPath, header + renderManifest(merged, ex.notes));
+    });
+    return {
+      changed,
+      diff: changed ? diff : [],
+      steps: merged.length,
+      ambiguous: ex.ambiguous,
+      notes: ex.notes,
+      strategy: ex.strategy,
+      preparedPlanPath,
+    };
+  }
+
+  private planInfo(runId: string): PlanInfo {
+    const ambiguous = this.store.getCounter(runId, PLAN_AMBIGUOUS);
+    return {
+      changed: false,
+      diff: [],
+      steps: this.store.getSteps(runId).length,
+      ambiguous: ambiguous !== null,
+      notes: ambiguous ? (JSON.parse(ambiguous) as string[]) : [],
+      strategy: this.store.getCounter(runId, "plan-strategy") ?? "none",
+      preparedPlanPath: this.store.getCounter(runId, "prepared-plan-path") ?? this.artifactPath(runId, "prepared-plan.md"),
+    };
   }
 
   // ---------------------------------------------------------------- run loop
@@ -252,6 +457,14 @@ export class Controller {
         return State.PAUSED;
       }
       if (e instanceof HaltSignal) return this.requireRun(runId).state;
+      if (e instanceof GitError) {
+        // Fail closed: a gate is never evaluated on substitute evidence. The
+        // session's outcome (if any) is kept and re-gated after the fix.
+        this.holdOutcome(runId);
+        this.stopRun(runId, State.PAUSED,
+          `Git failed, so the checkout could not be verified: ${e.message}. Fix the cause, then 'qfb resume ${runId}'.`);
+        return State.PAUSED;
+      }
       throw e;
     } finally {
       this.inflight = null;
@@ -351,19 +564,24 @@ export class Controller {
     const gate = mechanicalGate({
       mode: "writer",
       artifact: a,
+      artifactProblem: got.problem,
       sessionCompleted: result.settled && !result.timedOut,
       before,
       after,
       expectedBranch: run.branch,
       allowedPathPrefixes: [],
       denyList: run.denyList,
-      changedFiles: safe(() => git.changedFiles(run.baseRef), a?.changedFiles ?? []),
-      diffText: safe(() => git.workingDiff(run.baseRef), ""),
+      ...this.writerEvidence(run, git),
       verifiedTests: verified,
     });
     const reasons = claimed && claimed !== AgentStatus.DONE ? [`agent claimed ${claimed}: ${a?.summary ?? ""}`, ...gate.failures] : gate.failures;
     const evidence = JSON.stringify({ claimed, gate: gate.passed, failures: reasons, tests: verified });
 
+    this.noteUnscannable(runId, gate.unscannable);
+    if (gate.vetOnly && claimed === AgentStatus.DONE) {
+      this.holdForVetting(runId, gate.unscannable, `Step ${next.id}`);
+      return;
+    }
     if (gate.passed && claimed === AgentStatus.DONE) {
       // Side effect first; the DB records below are one atomic batch. A crash in
       // between replays this outcome, and commitAll() is then a no-op.
@@ -424,7 +642,7 @@ export class Controller {
         sessionId: `${runId}-harden-${key}-p${pass}-a${n}`,
         artifactPath,
         label: { feature: runId, phase: stage, stepId },
-        prompt: this.buildHardeningPrompt(run, stage, artifactPath, `gate-failures:${kind}:${stepId}`),
+        prompt: this.buildHardeningPrompt(run, stage, stepId, artifactPath, `gate-failures:${kind}:${stepId}`),
       });
     }
 
@@ -450,20 +668,25 @@ export class Controller {
     const gate = mechanicalGate({
       mode: readOnly ? "read-only" : "writer",
       artifact: a,
+      artifactProblem: got.problem,
       sessionCompleted: result.settled && !result.timedOut,
       before,
       after,
       expectedBranch: run.branch,
       allowedPathPrefixes: [],
       denyList: run.denyList,
-      changedFiles: readOnly ? [] : safe(() => git.changedFiles(run.baseRef), a?.changedFiles ?? []),
-      diffText: readOnly ? "" : safe(() => git.workingDiff(run.baseRef), ""),
+      ...(readOnly ? { changedFiles: [], added: NO_CONTENT } : this.writerEvidence(run, git)),
       verifiedTests: verified,
       allowFailingTestsWithBugs: true,
     });
     const reasons = claimed && claimed !== AgentStatus.DONE ? [`agent claimed ${claimed}: ${a?.summary ?? ""}`, ...gate.failures] : gate.failures;
     const evidence = JSON.stringify({ claimed, gate: gate.passed, failures: reasons, tests: verified });
 
+    this.noteUnscannable(runId, gate.unscannable);
+    if (gate.vetOnly && claimed === AgentStatus.DONE) {
+      this.holdForVetting(runId, gate.unscannable, `Hardening ${key} stage`);
+      return;
+    }
     if (!gate.passed || claimed !== AgentStatus.DONE) {
       const budget = key === "fix" ? run.config.maxHardeningFixIterations : run.config.maxHardeningTestAttempts;
       this.store.tx(() => {
@@ -565,7 +788,7 @@ export class Controller {
         sessionId: `${runId}-review-${n}`,
         artifactPath,
         label: { feature: runId, phase: "REVIEWING", stepId: "review", reviewIteration: n },
-        prompt: this.buildReviewPrompt(run.baseRef, run.config.reviewLevel, artifactPath),
+        prompt: this.buildReviewPrompt(run, artifactPath),
       });
     }
 
@@ -577,6 +800,7 @@ export class Controller {
     const gate = mechanicalGate({
       mode: "read-only",
       artifact: a,
+      artifactProblem: got.problem,
       sessionCompleted: result.settled && !result.timedOut,
       before,
       after: candidate,
@@ -584,7 +808,7 @@ export class Controller {
       allowedPathPrefixes: [],
       denyList: run.denyList,
       changedFiles: [],
-      diffText: "",
+      added: NO_CONTENT,
       verifiedTests: [],
     });
     if (!gate.passed) {
@@ -620,6 +844,26 @@ export class Controller {
     }
 
     if (isAcceptable(report, run.config.strictReviewPolicy)) {
+      // Final confidentiality gate over everything the candidate adds vs base.
+      // Every writer stage was scanned, but a pause can be resumed without the
+      // leak being removed (e.g. fix-pr's resumes straight into review).
+      const { added } = this.writerEvidence(run, git);
+      const leaks = confidentialityFailures(added, run.denyList);
+      this.noteUnscannable(runId, leaks.length > 0 ? added.unscannable : []);
+      if (leaks.length > 0 && leaks.length === added.unscannable.length) {
+        this.holdForVetting(runId, added.unscannable, "Final confidentiality check of the reviewed candidate");
+        return;
+      }
+      if (leaks.length > 0) {
+        this.store.tx(() => {
+          record();
+          this.stopRun(runId, State.PAUSED,
+            `Final confidentiality check of the reviewed candidate failed: ${leaks.join(" ")} ` +
+              `Remove the leak, then 'qfb resume ${runId}' (a fresh review follows).`);
+        });
+        return;
+      }
+
       // Final mechanical test gate on the reviewed candidate: every validation
       // command accepted during the run is re-run here by the controller.
       const suite = await this.runRegressionSuite(run, got.row);
@@ -694,7 +938,7 @@ export class Controller {
         sessionId: `${runId}-fix-${n}`,
         artifactPath,
         label: { feature: runId, phase: "FIXING", stepId: "fix", reviewIteration: n },
-        prompt: this.buildFixPrompt(findings, artifactPath),
+        prompt: this.buildFixPrompt(run, findings, artifactPath),
       });
     }
 
@@ -707,7 +951,8 @@ export class Controller {
     const outcome = a?.fixOutcome;
     if (outcome !== FixOutcome.CLEAN) {
       // Only Clean may advance the normal workflow (Section 3).
-      this.stopRun(runId, State.FAILED, `fix-pr returned ${outcome ?? "unknown"}; stopping normal progression.`);
+      const what = a ? `returned ${outcome ?? "no fixOutcome"}` : `left no valid artifact (${got.problem ?? "unknown"})`;
+      this.stopRun(runId, State.FAILED, `fix-pr ${what}; stopping normal progression.`);
       return;
     }
 
@@ -723,18 +968,21 @@ export class Controller {
       expectedBranch: run.branch,
       allowedPathPrefixes: [],
       denyList: run.denyList,
-      changedFiles: safe(() => git.changedFiles(run.baseRef), a!.changedFiles),
-      diffText: safe(() => git.workingDiff(run.baseRef), ""),
+      ...this.writerEvidence(run, git),
       verifiedTests: verified,
     });
     const reasons = a!.status !== AgentStatus.DONE ? [`agent claimed ${a!.status}: ${a!.summary}`, ...gate.failures] : gate.failures;
     const evidence = JSON.stringify({ outcome, gate: gate.passed, failures: reasons, tests: verified });
+    // No hold here: resuming a fix pause goes to a fresh review, whose final
+    // confidentiality check re-examines these files (vetted or not).
+    this.noteUnscannable(runId, gate.unscannable);
 
     if (!gate.passed || a!.status !== AgentStatus.DONE) {
       this.store.tx(() => {
         this.transition(runId, State.FIXING, State.VERIFYING_FIX, "fix-claimed-clean", evidence);
         this.stopRun(runId, gate.pause ? State.PAUSED : State.FAILED,
-          `fix-pr claimed Clean but mechanical verification failed: ${reasons.join("; ")}`);
+          `fix-pr claimed Clean but mechanical verification failed: ${reasons.join("; ")}` +
+            (gate.vetOnly ? ` If the file(s) are clean, 'qfb resume ${runId} --accept-unscannable'.` : ""));
       });
       return;
     }
@@ -811,7 +1059,7 @@ export class Controller {
    * steps and grants a fresh, audited budget window (budgets are never reset
    * merely because a controller restarts).
    */
-  async resume(runId: string): Promise<StateName> {
+  async resume(runId: string, opts: { acceptUnscannable?: boolean } = {}): Promise<StateName> {
     if (!this.store.acquireLock(runId)) throw new Error(this.lockedMessage(runId));
     try {
       const run = this.requireRun(runId);
@@ -819,6 +1067,12 @@ export class Controller {
       if (this.designChanged(runId)) {
         this.stopRun(runId, State.PAUSED, DESIGN_CHANGED);
         throw new Error(`${DESIGN_CHANGED} Review the edited design, then 'qfb approve ${runId}'.`);
+      }
+      // The operator vouches for files the confidentiality scan could not read:
+      // exactly the content the gate saw (path + digest), nothing later.
+      const vetted = opts.acceptUnscannable ? this.unscannableList(runId, UNSCANNABLE_PENDING) : [];
+      if (opts.acceptUnscannable && vetted.length === 0) {
+        throw new Error(`Run ${runId} has no unscannable files awaiting a decision.`);
       }
       const open = this.store.openSessions(runId);
       for (const s of open) {
@@ -842,9 +1096,18 @@ export class Controller {
         }
         this.store.deleteCounter(runId, PAUSE_REQUEST);
         this.store.deleteCounter(runId, STOP_REQUEST);
+        if (vetted.length > 0) {
+          const accepted = this.unscannableList(runId, UNSCANNABLE_ACCEPTED);
+          this.store.setCounter(runId, UNSCANNABLE_ACCEPTED, JSON.stringify([...accepted, ...vetted]));
+          this.store.deleteCounter(runId, UNSCANNABLE_PENDING);
+        }
         this.store.setStopReason(runId, null);
         this.transition(runId, run.state, target, retry ? "operator-retry" : "operator-resume",
-          JSON.stringify({ previousStopReason: run.stopReason, evidence }));
+          JSON.stringify({
+            previousStopReason: run.stopReason,
+            evidence,
+            ...(vetted.length > 0 ? { vettedUnscannable: vetted } : {}),
+          }));
       });
       return target;
     } finally {
@@ -863,11 +1126,14 @@ export class Controller {
       repoPath: run.repoPath,
       branch: run.branch,
       baseRef: run.baseRef,
+      baseSpec: run.baseSpec,
       stopReason: run.stopReason,
       resumeTo: isOrthogonal(run.state) ? this.resumeStateOf(runId) : null,
       pendingRequests: requests.map((k) => k.replace("request-", "")),
+      unscannablePending: this.unscannableList(runId, UNSCANNABLE_PENDING).map((f) => f.path),
       preparedPlanPath: this.store.getCounter(runId, "prepared-plan-path"),
       planStrategy: this.store.getCounter(runId, "plan-strategy"),
+      planAmbiguous: this.store.getCounter(runId, PLAN_AMBIGUOUS) !== null,
       steps: steps.map((s) => ({ id: s.id, status: s.status, attempts: s.attempts, text: s.text.split("\n")[0] })),
       stepsDone: steps.filter((s) => s.status === "done").length,
       stepsTotal: steps.length,
@@ -934,16 +1200,18 @@ export class Controller {
   private unconsumed(runId: string, kind: string, stepId: string): Obtained | null {
     const row = this.store.latestSession(runId, kind, stepId);
     if (!row || row.consumedAt || !row.endedAt) return null;
-    let artifact: TaskArtifact | null = null;
+    let raw: unknown = null;
     try {
-      artifact = validateArtifact(JSON.parse(readFileSync(row.artifactPath, "utf8")));
+      raw = JSON.parse(readFileSync(row.artifactPath, "utf8"));
     } catch {
-      artifact = null;
+      raw = null;
     }
+    const { artifact, problem } = checkArtifact(raw, this.expectedArtifact(row));
     this.inflight = row.rowId;
     const run = this.requireRun(runId);
     return {
       row,
+      problem,
       before: row.gitBefore ?? this.makeGit(run.repoPath).snapshot(run.baseRef),
       result: {
         sessionId: row.sessionId,
@@ -978,12 +1246,76 @@ export class Controller {
       prompt: o.prompt,
       onSpawn: (pid) => this.store.setSessionPid(rowId, pid, hostname()),
     });
-    const artifact = validateArtifact(result.artifact);
+    const { artifact, problem } = checkArtifact(result.artifact, this.expectedArtifact(this.store.getSession(rowId)!));
     const stopped = this.store.getCounter(run.id, STOP_REQUEST) !== null;
     const status = stopped ? "stopped" : artifact?.status ?? (result.settled ? "unknown" : "aborted");
     this.store.endSession(rowId, status, result.settled ? result.exitCode ?? 0 : null, result.timedOut);
     if (stopped) this.haltForStop(run.id, rowId);
-    return { result: { ...result, artifact }, row: this.store.getSession(rowId)!, before };
+    return { result: { ...result, artifact }, row: this.store.getSession(rowId)!, before, problem };
+  }
+
+  /** The identity a session's artifact must carry (H6): this run, step, kind, and written after it started. */
+  private expectedArtifact(row: SessionRow): ExpectedArtifact {
+    return {
+      runId: row.runId,
+      stepId: row.stepId,
+      kind: ARTIFACT_KIND[row.kind] ?? (row.kind as TaskArtifact["kind"]),
+      startedAt: row.startedAt,
+    };
+  }
+
+  // ---------------------------------------------------------------- gate evidence
+  /**
+   * Git-derived evidence for a writer gate. A git failure throws GitError and
+   * pauses the run: neither the agent's self-reported files nor an empty diff
+   * is ever substituted. Unscannable files an operator already vetted (same
+   * path, same content digest) are not reported again.
+   */
+  private writerEvidence(run: RunRow, git: GitLike): { changedFiles: string[]; added: AddedContent } {
+    const added = git.addedContent(run.baseRef);
+    const vetted = this.unscannableList(run.id, UNSCANNABLE_ACCEPTED);
+    return {
+      changedFiles: git.changedFiles(run.baseRef),
+      added: {
+        files: added.files,
+        unscannable: added.unscannable.filter((u) => !vetted.some((v) => v.path === u.path && v.digest === u.digest)),
+      },
+    };
+  }
+
+  private unscannableList(runId: string, key: string): UnscannableFile[] {
+    const v = this.store.getCounter(runId, key);
+    return v ? (JSON.parse(v) as UnscannableFile[]) : [];
+  }
+
+  /** Remember what the latest gate could not scan, for 'resume --accept-unscannable'. */
+  private noteUnscannable(runId: string, files: UnscannableFile[]): void {
+    if (files.length > 0) this.store.setCounter(runId, UNSCANNABLE_PENDING, JSON.stringify(files));
+    else this.store.deleteCounter(runId, UNSCANNABLE_PENDING);
+  }
+
+  /**
+   * The outcome is acceptable except for files the confidentiality scan could
+   * not read: pause for a human to vet them, keeping the outcome so that it is
+   * re-gated (not relaunched) once they have decided.
+   */
+  private holdForVetting(runId: string, files: UnscannableFile[], what: string): void {
+    this.holdOutcome(runId);
+    this.stopRun(runId, State.PAUSED,
+      `${what}: ${files.length} changed file(s) cannot be scanned for deny-listed terms: ` +
+        `${files.map((f) => `${f.path} (${f.reason})`).join(", ")}. Check them by hand; if they are clean, ` +
+        `'qfb resume ${runId} --accept-unscannable'; otherwise remove them and 'qfb resume ${runId}'.`);
+  }
+
+  /**
+   * Keep the in-flight session's outcome unconsumed across the coming pause,
+   * so resuming re-processes it instead of launching a new session. Only when
+   * resuming returns to the same handler (a paused FIXING resumes into a fresh
+   * REVIEWING, which would orphan a held fix outcome).
+   */
+  private holdOutcome(runId: string): void {
+    const state = this.requireRun(runId).state;
+    if (resumeTarget(state) === state) this.inflight = null;
   }
 
   /**
@@ -1053,8 +1385,8 @@ export class Controller {
   /** Save the working-tree state an interrupted session left behind. Never modifies the checkout. */
   private preserveInterrupted(run: RunRow, git: GitLike, s: SessionRow): string {
     const path = `${s.artifactPath}.interrupted.patch`;
-    const files = safe(() => git.changedFiles(run.baseRef).join("\n"), "(unavailable)");
-    const diff = safe(() => git.workingDiff(run.baseRef), "(unavailable)");
+    const files = evidenceText(() => git.changedFiles(run.baseRef).join("\n"));
+    const diff = evidenceText(() => git.workingDiff(run.baseRef));
     writeFileSync(path, `# session ${s.sessionId} interrupted\n# changed vs ${run.baseRef}:\n${files}\n\n${diff}\n`);
     return path;
   }
@@ -1210,6 +1542,14 @@ export class Controller {
     `  QFB re-runs each one itself and gates on the REAL exit code; a claimed exit code that differs rejects the result.`,
   ];
 
+  /** The identity fields QFB checks on every artifact (a mismatch rejects it). */
+  private static identity(runId: string, stepId: string, kind: TaskArtifact["kind"]): string[] {
+    return [
+      `  Identify it with runId:"${runId}", stepId:"${stepId}", kind:"${kind}", and createdAt set to the current UTC`,
+      `  time in ISO-8601 (run \`date -u +%Y-%m-%dT%H:%M:%SZ\`); QFB rejects an artifact that does not match this session.`,
+    ];
+  }
+
   private buildStepPrompt(
     run: RunRow,
     step: { id: string; text: string },
@@ -1239,13 +1579,14 @@ export class Controller {
       `- Do NOT change the architecture, requirements, or other plan steps.`,
       ...Controller.COMMON_RULES,
       `- When done, write a typed JSON TaskArtifact to: ${artifactPath}`,
-      `  with fields: {runId, stepId, kind:"implementation", status, summary, changedFiles[],`,
+      `  with fields: {runId, stepId, kind, status, summary, changedFiles[],`,
       `  testCommands[{command,exitCode}], limitations[], notableDecisions[], createdAt}.`,
+      ...Controller.identity(run.id, step.id, "implementation"),
       `- status MUST be one of DONE | BLOCKED | NEEDS_DECISION | FAILED.`,
     ].join("\n");
   }
 
-  private buildHardeningPrompt(run: RunRow, stage: StateName, artifactPath: string, failuresKey: string): string {
+  private buildHardeningPrompt(run: RunRow, stage: StateName, stepId: string, artifactPath: string, failuresKey: string): string {
     const gaps = this.store.getCounter(run.id, "hardening-gap-artifact");
     const bugDoc = this.store.getCounter(run.id, "hardening-bug-artifact");
     const openBugs = this.store.getCounter(run.id, "open-bugs") ?? "[]";
@@ -1277,23 +1618,27 @@ export class Controller {
       ...(prior.length ? [`The previous attempt was rejected by QFB's mechanical gate: ${prior.join("; ")}`] : []),
       `Rules:`,
       ...Controller.COMMON_RULES,
-      `Write a typed JSON TaskArtifact to ${artifactPath} with status DONE | BLOCKED | NEEDS_DECISION | FAILED.`,
+      `Write a typed JSON TaskArtifact to ${artifactPath} with status DONE | BLOCKED | NEEDS_DECISION | FAILED`,
+      `and fields {runId, stepId, kind, status, summary, changedFiles[], testCommands[{command,exitCode}], limitations[],`,
+      `notableDecisions[], bugs[], handoffPath, createdAt}.`,
+      ...Controller.identity(run.id, stepId, stage === State.HARDENING_IDENTIFY ? "coverage-gap" : "bug"),
     ].join("\n");
   }
 
-  private buildReviewPrompt(base: string, level: number, artifactPath: string): string {
+  private buildReviewPrompt(run: RunRow, artifactPath: string): string {
     return [
       `Run QuestDB's review-pr skill on the cumulative feature diff.`,
-      `Invoke: /skill:review-pr --range=${base}.. --level=${level}`,
+      `Invoke: /skill:review-pr --range=${run.baseRef}.. --level=${run.config.reviewLevel}`,
       `This session is READ-ONLY: do NOT modify any file in the checkout (QFB verifies the tree is unchanged).`,
       `Write the COMPLETE raw report to ${artifactPath}.report.md and set reviewReportPath to that path.`,
-      `The report MUST contain a machine-readable fenced \`\`\`qfb-review JSON block with`,
-      `{verdict, testGatePassed, findings:[{id,severity,location,evidence}]}.`,
-      `Write a typed JSON TaskArtifact (kind:"review", status DONE) to ${artifactPath}.`,
+      `The report MUST contain exactly ONE machine-readable fenced \`\`\`qfb-review JSON block (never quote or`,
+      `repeat it) with {verdict, testGatePassed, findings:[{id,severity,location,evidence}]}; finding ids must be unique.`,
+      `Write a typed JSON TaskArtifact (status DONE) to ${artifactPath}.`,
+      ...Controller.identity(run.id, "review", "review"),
     ].join("\n");
   }
 
-  private buildFixPrompt(findings: unknown, artifactPath: string): string {
+  private buildFixPrompt(run: RunRow, findings: unknown, artifactPath: string): string {
     return [
       `Run QuestDB's fix-pr skill against these authorized findings:`,
       JSON.stringify(findings, null, 2),
@@ -1301,7 +1646,8 @@ export class Controller {
       `Rules:`,
       ...Controller.COMMON_RULES,
       `Report the skill's distinct outcome in fixOutcome: Clean | Blocked | Diverging | Exhausted.`,
-      `Write a typed JSON TaskArtifact (kind:"fix", status DONE unless blocked) to ${artifactPath}.`,
+      `Write a typed JSON TaskArtifact (status DONE unless blocked) to ${artifactPath}.`,
+      ...Controller.identity(run.id, "fix", "fix"),
     ].join("\n");
   }
 }
@@ -1327,11 +1673,16 @@ function sha256(s: string): string {
   return createHash("sha256").update(s).digest("hex");
 }
 
-function safe<T>(fn: () => T, fallback: T): T {
+function firstLine(s: string): string {
+  return s.split("\n")[0] ?? "";
+}
+
+/** Evidence text that must never fail the operation that records it. */
+function evidenceText(fn: () => string): string {
   try {
     return fn();
-  } catch {
-    return fallback;
+  } catch (e) {
+    return `(unavailable: ${(e as Error).message})`;
   }
 }
 

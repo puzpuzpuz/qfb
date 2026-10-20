@@ -1,6 +1,6 @@
-import { scanForDenyTerms } from "./confidentiality.ts";
+import { effectiveTerms, scanForDenyTerms } from "./confidentiality.ts";
 import { AgentStatus } from "./types.ts";
-import type { TaskArtifact, GitSnapshot, VerifiedTest } from "./types.ts";
+import type { AddedContent, TaskArtifact, GitSnapshot, UnscannableFile, VerifiedTest } from "./types.ts";
 
 /**
  * Orchestration-artifact hygiene (Section 7.1): spec/handoff files must never
@@ -22,6 +22,8 @@ export interface GateInput {
    */
   mode: "writer" | "read-only";
   artifact: TaskArtifact | null;
+  /** Why the artifact was rejected (shape or identity), when known. */
+  artifactProblem?: string | null;
   /** Whether the Pi session completed normally (not aborted). */
   sessionCompleted: boolean;
   before: GitSnapshot;
@@ -40,10 +42,12 @@ export interface GateInput {
    */
   changedFiles: string[];
   /**
-   * Authoritative diff content to scan for confidentiality leaks: the
-   * working-tree diff against base plus untracked file contents.
+   * Authoritative, git-derived content the change ADDS versus the feature base
+   * (added lines plus untracked file contents), scanned for deny-listed terms.
+   * Files that could not be scanned make the gate fail closed. Ignored in
+   * read-only mode.
    */
-  diffText: string;
+  added: AddedContent;
   /**
    * The artifact's claimed validation commands, re-run by the controller with
    * their REAL exit codes. The gate decides on these, never on the claim.
@@ -61,32 +65,82 @@ export interface GateResult {
   failures: string[];
   /** True when a failure warrants pausing for a human decision vs. retry. */
   pause: boolean;
+  /** Changed files the confidentiality scan could not read (each is also listed in `failures`). */
+  unscannable: UnscannableFile[];
+  /**
+   * True when the ONLY failures are unscannable files: the result is otherwise
+   * acceptable, so it can be re-gated once an operator has vetted them.
+   */
+  vetOnly: boolean;
+}
+
+/** Who an artifact must belong to: the session that was asked to write it. */
+export interface ExpectedArtifact {
+  runId: string;
+  stepId: string;
+  kind: TaskArtifact["kind"];
+  /** Session start (ISO). An artifact created before it is a leftover, not this session's. */
+  startedAt: string;
 }
 
 /**
- * Validate the on-disk artifact's shape. Anything malformed is treated as "no
- * valid artifact" (a gate failure) instead of crashing the controller.
+ * Clock tolerance for `createdAt`: agents often write second-precision
+ * timestamps, so an artifact written in the session's first second can appear
+ * slightly older than the millisecond-precision session start.
  */
-export function validateArtifact(x: unknown): TaskArtifact | null {
-  if (!x || typeof x !== "object" || Array.isArray(x)) return null;
+const CREATED_AT_SLACK_MS = 5_000;
+
+export type ArtifactCheck = { artifact: TaskArtifact; problem: null } | { artifact: null; problem: string };
+
+/** `checkArtifact(...).artifact`: the validated artifact, or null for "no valid artifact". */
+export function validateArtifact(x: unknown, expected?: ExpectedArtifact): TaskArtifact | null {
+  return checkArtifact(x, expected).artifact;
+}
+
+/**
+ * Validate the on-disk artifact's shape and, when `expected` is given, that it
+ * belongs to this session (run, step, kind, and not created before the session
+ * started). Anything malformed or foreign is "no valid artifact" (a gate
+ * failure, with the reason) instead of crashing the controller.
+ */
+export function checkArtifact(x: unknown, expected?: ExpectedArtifact): ArtifactCheck {
+  const bad = (problem: string): ArtifactCheck => ({ artifact: null, problem });
+  if (x === null || x === undefined) return bad("none was written, or it is not valid JSON");
+  if (typeof x !== "object" || Array.isArray(x)) return bad("the artifact is not a JSON object");
   const a = x as Record<string, unknown>;
-  if (!Object.values(AgentStatus).includes(a.status as never)) return null;
+  if (!Object.values(AgentStatus).includes(a.status as never)) return bad(`invalid status ${JSON.stringify(a.status)}`);
   const list = (v: unknown): unknown[] | null => (v === undefined || v === null ? [] : Array.isArray(v) ? v : null);
   const testCommands = list(a.testCommands);
   const changedFiles = list(a.changedFiles);
   const limitations = list(a.limitations);
   const notableDecisions = list(a.notableDecisions);
   const bugs = list(a.bugs);
-  if (!testCommands || !changedFiles || !limitations || !notableDecisions || !bugs) return null;
+  if (!testCommands || !changedFiles || !limitations || !notableDecisions || !bugs) {
+    return bad("testCommands, changedFiles, limitations, notableDecisions and bugs must be arrays");
+  }
   for (const t of testCommands) {
     const o = t as Record<string, unknown> | null;
-    if (!o || typeof o.command !== "string" || !o.command.trim() || typeof o.exitCode !== "number") return null;
+    if (!o || typeof o.command !== "string" || !o.command.trim() || typeof o.exitCode !== "number") {
+      return bad("every testCommands entry needs a non-empty command and a numeric exitCode");
+    }
   }
   for (const b of bugs) {
     const o = b as Record<string, unknown> | null;
-    if (!o || typeof o.id !== "string" || !o.id) return null;
+    if (!o || typeof o.id !== "string" || !o.id) return bad("every bugs entry needs a non-empty id");
   }
-  return {
+  if (expected) {
+    for (const k of ["runId", "stepId", "kind"] as const) {
+      if (a[k] !== expected[k]) {
+        return bad(`${k} is ${JSON.stringify(a[k])}, expected ${JSON.stringify(expected[k])} (an artifact from another session?)`);
+      }
+    }
+    const created = typeof a.createdAt === "string" ? Date.parse(a.createdAt) : NaN;
+    if (Number.isNaN(created)) return bad(`createdAt ${JSON.stringify(a.createdAt)} is not an ISO-8601 timestamp`);
+    if (created < Date.parse(expected.startedAt) - CREATED_AT_SLACK_MS) {
+      return bad(`createdAt ${a.createdAt} predates the session start ${expected.startedAt} (a leftover artifact?)`);
+    }
+  }
+  const artifact: TaskArtifact = {
     ...(a as unknown as TaskArtifact),
     summary: typeof a.summary === "string" ? a.summary : "",
     testCommands: testCommands as TaskArtifact["testCommands"],
@@ -99,6 +153,38 @@ export function validateArtifact(x: unknown): TaskArtifact | null {
       repro: typeof b.repro === "string" ? b.repro : "",
     })),
   };
+  return { artifact, problem: null };
+}
+
+const MAX_LISTED_PATHS = 5;
+
+function listPaths(paths: string[]): string {
+  const shown = paths.slice(0, MAX_LISTED_PATHS).join(", ");
+  return paths.length > MAX_LISTED_PATHS ? `${shown} (+${paths.length - MAX_LISTED_PATHS} more)` : shown;
+}
+
+/**
+ * Confidentiality check (Section 7.1) over what a change adds: each deny-listed
+ * term found in an added/changed file's name or added content, and each file
+ * that could not be scanned (fail closed). Nothing to look for, nothing to fail.
+ */
+export function confidentialityFailures(added: AddedContent, denyList: string[]): string[] {
+  if (effectiveTerms(denyList).length === 0) return [];
+  const hits = new Map<string, string[]>();
+  for (const f of added.files) {
+    for (const m of scanForDenyTerms(`${f.path}\n${f.added}`, denyList)) {
+      const paths = hits.get(m.term) ?? [];
+      paths.push(f.path);
+      hits.set(m.term, paths);
+    }
+  }
+  const failures = [...hits].map(
+    ([term, paths]) => `Confidentiality violation: deny-listed term "${term}" added in ${listPaths(paths)}.`,
+  );
+  for (const u of added.unscannable) {
+    failures.push(`Cannot check ${u.path} for deny-listed terms (${u.reason}); a human must vet it.`);
+  }
+  return failures;
 }
 
 /**
@@ -114,7 +200,9 @@ export function mechanicalGate(input: GateInput): GateResult {
     failures.push("Session did not complete normally (aborted or timed out).");
   }
   if (!input.artifact) {
-    failures.push("No valid typed task handoff artifact found at the expected path.");
+    failures.push(
+      `No valid typed task handoff artifact found at the expected path${input.artifactProblem ? `: ${input.artifactProblem}` : "."}`,
+    );
   }
 
   // Git branch / checkout identity intact — for every kind of session.
@@ -140,7 +228,7 @@ export function mechanicalGate(input: GateInput): GateResult {
       failures.push("Read-only session modified the checkout; its result is stale and cannot be accepted.");
       pause = true;
     }
-    return { passed: failures.length === 0, failures, pause };
+    return { passed: failures.length === 0, failures, pause, unscannable: [], vetOnly: false };
   }
 
   // ---- writer mode ----
@@ -184,15 +272,16 @@ export function mechanicalGate(input: GateInput): GateResult {
     }
   }
 
-  // Confidentiality deny-list (Section 7.1): scan the real working-tree diff
-  // content (plus untracked file contents) and the git-derived changed names.
-  const denyMatches = scanForDenyTerms(input.diffText + "\n" + changed.join("\n"), input.denyList);
-  if (denyMatches.length > 0) {
-    for (const m of denyMatches) {
-      failures.push(`Confidentiality violation: deny-listed term "${m.term}" appears in changeset.`);
-    }
+  // Confidentiality deny-list (Section 7.1): scan what the change really adds
+  // (git-derived), failing closed on anything that could not be scanned.
+  const otherFailures = failures.length;
+  const leaks = confidentialityFailures(input.added, input.denyList);
+  if (leaks.length > 0) {
+    failures.push(...leaks);
     pause = true;
   }
+  const unscannable = effectiveTerms(input.denyList).length > 0 ? input.added.unscannable : [];
+  const vetOnly = otherFailures === 0 && unscannable.length > 0 && leaks.length === unscannable.length;
 
-  return { passed: failures.length === 0, failures, pause };
+  return { passed: failures.length === 0, failures, pause, unscannable, vetOnly };
 }

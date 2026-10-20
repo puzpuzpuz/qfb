@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,13 +35,18 @@ test("shellTestRunner kills the whole group on timeout", async () => {
   assert.equal(await shellTestRunner("sleep 30", d, join(d, "t.log"), 200), 124);
 });
 
-/** A stand-in `pi` that writes its artifact, leaves a stray behind, and exits. */
-function fakePi(dir: string, body: string): void {
+/** Put a stand-in executable `name` first on PATH. */
+function fakeBin(dir: string, name: string, body: string): void {
   const bin = join(dir, "bin");
   execFileSync("mkdir", ["-p", bin]);
-  writeFileSync(join(bin, "pi"), `#!/bin/sh\n${body}\n`);
-  chmodSync(join(bin, "pi"), 0o755);
+  writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
+  chmodSync(join(bin, name), 0o755);
   process.env.PATH = `${bin}:${process.env.PATH}`;
+}
+
+/** A stand-in `pi` that writes its artifact, leaves a stray behind, and exits. */
+function fakePi(dir: string, body: string): void {
+  fakeBin(dir, "pi", body);
 }
 
 test("RpcPiAdapter: own process group, pid reported, artifact read, strays reaped", async () => {
@@ -123,4 +128,43 @@ test("pushBlocker: only the exact reviewed commit, clean, on the run's branch, u
   const r = openPrIfNone(dir, git, { ...req, title: "feat: AcmeCorp ingest" });
   assert.equal(r.opened, false);
   assert.match(r.reason, /deny-listed/);
+});
+
+test("openPrIfNone pushes the accepted commit to an already-open PR instead of leaving it stale", () => {
+  const { dir, git, base } = repo();
+  const remote = tmp();
+  execFileSync("git", ["init", "-q", "--bare", remote]);
+  execFileSync("git", ["remote", "add", "origin", remote], { cwd: dir });
+  execFileSync("git", ["push", "-q", "origin", "feature/x"], { cwd: dir, stdio: "ignore" }); // the PR as first opened
+  writeFileSync(join(dir, "b.txt"), "b\n");
+  const head = git.commitAll("[qfb] S1");
+  const created = join(dir, "..", "pr-created");
+  fakeBin(tmp(), "gh", [
+    `case "$1 $2" in`,
+    `  "pr list") echo '[{"url":"https://example.test/pr/7"}]' ;;`,
+    `  "pr create") touch ${created}; exit 1 ;;`,
+    `esac`,
+  ].join("\n"));
+  const r = openPrIfNone(dir, git, {
+    branch: "feature/x", prBase: "master", featureBase: base, title: "t", body: "b",
+    accepted: { branch: "feature/x", head, fingerprint: git.snapshot(base).dirtyFingerprint },
+    checkpointPolicy: "commit", denyList: [],
+  });
+  assert.deepEqual([r.opened, r.pushed, r.url], [false, true, "https://example.test/pr/7"]);
+  assert.match(r.reason, /pushed the accepted commit to the already-open PR/);
+  assert.equal(execFileSync("git", ["rev-parse", "feature/x"], { cwd: remote, encoding: "utf8" }).trim(), head);
+  assert.throws(() => readFileSync(created), "no second PR is created");
+});
+
+test("CLI: --level is validated (no NaN or out-of-range review level reaches a run)", () => {
+  const cli = (args: string[]) =>
+    spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "src/index.ts", ...args], {
+      encoding: "utf8",
+      env: { ...process.env, QFB_DB: join(tmp(), "q.sqlite"), QFB_ARTIFACTS: tmp() },
+    });
+  for (const level of [["--level", "7"], ["--level", "two"], ["--level"]]) {
+    const r = cli(["init", "--repo", tmp(), "--design", "d.md", "--base", "HEAD", ...level]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /--level must be 0, 1, 2 or 3/);
+  }
 });
