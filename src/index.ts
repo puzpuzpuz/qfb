@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --experimental-strip-types --no-warnings
 import { createInterface } from "node:readline/promises";
 import { Store } from "./store.ts";
 import { Controller } from "./controller.ts";

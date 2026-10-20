@@ -46,7 +46,19 @@ npm install        # only installs the TypeScript devDependency (for `npm run ty
 npm link           # optional: puts `qfb` on your PATH
 ```
 
-No compilation is required to run — `node src/index.ts <cmd>` works directly.
+No compilation is required to run. Invoke it in any of these equivalent ways:
+
+```bash
+npm run qfb -- <cmd> [flags]        # always works; flags handled for you
+./src/index.ts <cmd> [flags]        # executable shebang sets the right flags
+qfb <cmd> [flags]                   # after `npm link`
+```
+
+> **Node 22.6–22.17:** TypeScript type-stripping is behind a flag on these
+> versions, so a bare `node src/index.ts …` fails with `ERR_UNKNOWN_FILE_EXTENSION`.
+> Use one of the forms above (they pass `--experimental-strip-types`), or run
+> `node --experimental-strip-types src/index.ts …` directly. Node ≥ 22.18 needs
+> no flag.
 
 ## Quick start — one command
 

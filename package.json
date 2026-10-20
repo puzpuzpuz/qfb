@@ -7,7 +7,8 @@
     "qfb": "src/index.ts"
   },
   "scripts": {
-    "qfb": "node src/index.ts",
+    "qfb": "node --experimental-strip-types --no-warnings src/index.ts",
+    "start": "node --experimental-strip-types --no-warnings src/index.ts",
     "test": "node --test --experimental-strip-types --no-warnings 'test/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
