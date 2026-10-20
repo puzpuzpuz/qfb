@@ -29,6 +29,23 @@ export class Git {
     return this.run(["status", "--porcelain"]).length === 0;
   }
 
+  /** Merge-base of HEAD and the given ref; used to anchor the feature base. */
+  mergeBase(ref: string): string {
+    return this.run(["merge-base", "HEAD", ref]);
+  }
+
+  /** Best-effort default integration branch (origin/HEAD target, else master). */
+  defaultBase(): string {
+    try {
+      const sym = this.run(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
+      const m = /refs\/remotes\/origin\/(.+)$/.exec(sym);
+      if (m) return m[1]!;
+    } catch {
+      // ignore
+    }
+    return "master";
+  }
+
   untrackedFiles(): string[] {
     const out = this.run(["ls-files", "--others", "--exclude-standard"]);
     return out ? out.split("\n") : [];

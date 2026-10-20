@@ -221,6 +221,42 @@ test("two controller instances cannot run concurrently against the same run", as
   h.store.releaseLock(runId);
 });
 
+test("build-style run is interruptible and resumes without duplicating completed work", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    implDone("S1"),
+    () => ({ artifact: artifact({ stepId: "S2", status: "NEEDS_DECISION", summary: "needs a call" }) }),
+  ]);
+  const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b" });
+  h.controller.approve(runId);
+
+  // First invocation stops at the decision point.
+  const first = await h.controller.run(runId);
+  assert.equal(first, "paused");
+  assert.equal(h.controller.status(runId).stepsDone, 1);
+  const s1LaunchesAfterFirst = h.pi.launches.filter((l) => /-S1-/.test(l.sessionId)).length;
+  assert.equal(s1LaunchesAfterFirst, 1);
+
+  // Operator addresses it; queue the rest of the happy path and resume.
+  h.pi.push(implDone("S2")); h.pi.push(implDone("S3"));
+  for (const x of HAPPY_HARDENING) h.pi.push(x);
+  h.pi.push(review(APPROVED));
+  h.controller.resume(runId);
+
+  const second = await h.controller.run(runId);
+  assert.equal(second, "COMPLETED");
+  assert.equal(h.controller.status(runId).stepsDone, 3);
+  // S1 was never re-launched during the resumed run.
+  assert.equal(h.pi.launches.filter((l) => /-S1-/.test(l.sessionId)).length, 1);
+});
+
+test("findRun locates an existing run for the same repo/design/base (resumption key)", () => {
+  const h = makeHarness(THREE_STEP_DESIGN, []);
+  const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "base-ref" });
+  const found = h.store.findRun("/repo", h.designPath, "base-ref");
+  assert.equal(found?.id, runId);
+  assert.equal(h.store.findRun("/repo", h.designPath, "other-base"), null);
+});
+
 function writeReportLocal(req: PiLaunchRequest, report: unknown): string {
   const p = join(dirname(req.artifactPath), req.sessionId + "-raw.md");
   writeFileSync(p, "```qfb-review\n" + JSON.stringify(report) + "\n```\n");

@@ -48,31 +48,59 @@ npm link           # optional: puts `qfb` on your PATH
 
 No compilation is required to run — `node src/index.ts <cmd>` works directly.
 
-## Quick start
+## Quick start — one command
+
+The headline UX is a single, resumable command that validates everything,
+prepares and approves the plan, orchestrates the entire feature, and opens a PR
+if none is open:
 
 ```bash
-# 0. Preflight: Pi, Herdr, skills, subagents, execution-mode compatibility
-qfb doctor --repo /path/to/questdb
+qfb build --repo /path/to/questdb --design ./feature-design.md \
+          --deny "AcmeCorp,customer orders,trade_events" --yes
+```
 
-# 1. Preparation phase: read the design/handoff doc and normalize it into QFB's
-#    canonical plan manifest (stored in QFB's artifact dir, never the checkout)
-qfb init --repo /path/to/questdb --design ./feature-design.md --base origin/master \
-         --deny "AcmeCorp,customer orders,trade_events"
+What `qfb build` does, in order:
 
-# 2. Review the normalized manifest, then approve (freezes the design hash)
-qfb plan   run-xxxxxxxx     # the normalized, numbered manifest QFB will execute
-qfb status run-xxxxxxxx
-qfb approve run-xxxxxxxx
+1. **Validates** the environment (`doctor`: Pi, Herdr, skills, subagents, exec mode).
+2. **Derives** the feature base from `merge-base(HEAD, --pr-base)` unless you pass `--base`.
+3. **Prepares** the plan — normalizes the design/handoff doc into QFB's canonical manifest.
+4. **Approves** it — interactively (shows the manifest and prompts) or non-interactively with `--yes`.
+5. **Orchestrates** serial implementation → hardening → review/fix → completion.
+6. **Opens a PR** for the branch if none is open (disable with `--no-pr`).
 
-# 3. Run it (serial implementation → hardening → review/fix → completion)
-qfb run run-xxxxxxxx
+**Interruptible & resumable.** `build` finds-or-creates the run for a given
+`(repo, design, base)` and the controller recovers from persisted state, so if it
+is interrupted (Ctrl-C, crash, machine reboot) you simply **re-run the exact same
+command** and it carries on from where it stopped — never duplicating verified
+work. When it pauses for a human decision or stops on a budget, it tells you what
+to fix; address it and re-run.
 
-# Inspect, intervene, recover
-qfb status run-xxxxxxxx
-qfb pause  run-xxxxxxxx
-qfb resume run-xxxxxxxx
-qfb stop   run-xxxxxxxx
-qfb logs   run-xxxxxxxx
+### Useful `build` flags
+
+- `--yes` — approve non-interactively (required for unattended runs / non-TTY).
+- `--pr-base BRANCH` — PR target and base-derivation anchor (default: repo's default branch).
+- `--base REF` — pin the feature base explicitly instead of deriving it.
+- `--no-pr` — complete without opening a PR; `--pr-title "..."` overrides the generated title.
+- `--skip-doctor` — skip preflight (not recommended for unattended runs).
+- `--commit`, `--strict`, `--level N`, `--deny a,b,c` — as in `init` (see the table below).
+
+> **PR creation is an explicit deviation** from the spec's conservative default
+> (which never pushes or opens PRs). Running `qfb build` *is* that authorization,
+> and it happens only as the final step after the run reaches `COMPLETED`. Use
+> `--no-pr`, or the granular `qfb run` (which never pushes), to keep the
+> conservative behavior.
+
+### Granular / recovery commands
+
+The step-by-step commands remain available for inspection, manual control, and
+recovery — `build` is a thin orchestration over exactly these:
+
+```bash
+qfb init --repo /path/to/questdb --design ./feature-design.md --base origin/master
+qfb plan RUN_ID            # review the normalized manifest
+qfb approve RUN_ID
+qfb run RUN_ID             # drive to the next stopping point (resumes on re-run)
+qfb status / pause / resume / stop / logs RUN_ID
 ```
 
 See [`examples/`](examples/) for a sample design document and configuration.
@@ -107,6 +135,7 @@ An agent's `DONE` is a **claim, not a result** — it is only an input to the ga
 
 | Command | Purpose |
 |---------|---------|
+| `qfb build --repo PATH --design PATH [--base REF] [--pr-base BRANCH] [--yes] [--no-pr] [--pr-title …] [--skip-doctor] [--deny …] [--commit] [--strict] [--level N]` | **One-shot, resumable orchestration**: validate → prepare → approve → run → open PR. Re-run to resume. |
 | `qfb doctor [--repo PATH]` | Check Pi, Herdr, skills, subagents, credentials, execution-mode compatibility. |
 | `qfb init --repo PATH --design PATH --base REF [--deny a,b] [--commit] [--strict] [--level N]` | Create a run; extract + freeze the plan manifest. |
 | `qfb plan RUN_ID` | Print the normalized plan manifest produced by the preparation phase. |

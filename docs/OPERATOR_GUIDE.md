@@ -3,6 +3,31 @@
 This guide walks through running a feature from an approved design to completion, and how to
 intervene and recover.
 
+## The one-command path: `qfb build`
+
+Most of the time you want a single, resumable command:
+
+```bash
+qfb build --repo /path/to/questdb --design ./feature-design.md \
+          --deny "AcmeCorp,customer orders,trade_events" --yes
+```
+
+It runs preflight, prepares and approves the plan, orchestrates implementation 
+detection → hardening → review/fix to completion, and opens a PR if none is open.
+
+**It is interruptible and resumable.** `build` keys off `(repo, design, base)` and
+resumes the existing run from its persisted state. If it is interrupted 
+(Ctrl-C, crash, reboot), **re-run the identical command** — it continues from
+where it stopped and never repeats verified work. If it pauses for a decision or
+stops on a budget/no-progress condition, it prints the reason and the resumable
+next step; fix the issue and re-run `build` (or use the granular commands below).
+
+Without `--yes`, `build` shows the normalized manifest and prompts for approval
+interactively; on a non-TTY it stops at the approval gate and tells you to pass
+`--yes` or run `qfb approve`. The sections below describe the same lifecycle via
+the granular commands, which `build` orchestrates.
+
+
 ## 0. Preflight
 
 ```bash

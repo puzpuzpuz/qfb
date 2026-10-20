@@ -152,6 +152,19 @@ export class Store {
     };
   }
 
+  /**
+   * Find the most recent run for a (repo, design, base) triple. `build` uses
+   * this to resume an interrupted run instead of creating a duplicate.
+   */
+  findRun(repoPath: string, designPath: string, baseRef: string): RunRow | null {
+    const r = this.db
+      .prepare(
+        "SELECT id FROM runs WHERE repo_path = ? AND design_path = ? AND base_ref = ? ORDER BY created_at DESC LIMIT 1",
+      )
+      .get(repoPath, designPath, baseRef) as { id: string } | undefined;
+    return r ? this.getRun(r.id) : null;
+  }
+
   listRuns(): RunRow[] {
     const rows = this.db.prepare("SELECT id FROM runs ORDER BY created_at DESC").all() as { id: string }[];
     return rows.map((r) => this.getRun(r.id)!).filter(Boolean);
