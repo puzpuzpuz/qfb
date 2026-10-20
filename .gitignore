@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+# Local QFB state used during manual testing (the real state store lives under XDG state dir)
+.qfb-state/
+coverage/

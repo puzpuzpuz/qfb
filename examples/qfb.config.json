@@ -1,0 +1,21 @@
+{
+  "_comment": "Sample feature configuration. These map to RunConfig (src/types.ts). The CLI exposes the common ones as flags (--commit, --strict, --level, --deny); the rest use the documented defaults unless you extend `qfb init` to read this file.",
+
+  "base": "origin/master",
+  "denyList": ["AcmeCorp", "customer orders", "trade_events", "acme_trades"],
+
+  "reviewLevel": 2,
+  "strictReviewPolicy": false,
+  "checkpointPolicy": "snapshot",
+  "backend": "rpc",
+
+  "maxImplAttemptsPerStep": 3,
+  "maxReviewIterations": 5,
+  "maxInfraRetries": 3,
+  "maxHardeningGapPasses": 2,
+  "maxHardeningTestAttempts": 3,
+  "maxHardeningFixIterations": 3,
+  "maxNoProgress": 2,
+  "maxTotalSessions": 200,
+  "sessionInactivityTimeoutMs": 1800000
+}
