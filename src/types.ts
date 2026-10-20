@@ -8,6 +8,7 @@
 /** Lifecycle states owned by the durable controller (Section 14). */
 export const State = {
   CREATED: "CREATED",
+  PREPARING: "PREPARING",
   AWAITING_APPROVAL: "AWAITING_APPROVAL",
   READY: "READY",
   IMPLEMENTING: "IMPLEMENTING",

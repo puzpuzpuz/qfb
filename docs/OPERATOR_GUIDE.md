@@ -16,10 +16,18 @@ Every line must be `✓`. The three `repo:` checks confirm QuestDB's `CLAUDE.md`
 ## 1. Prepare the design document
 
 You (the developer) author and iterate the design doc in Phase A. It must contain an **ordered
-implementation plan** — conventional numbered steps, headings, or task checkboxes under an
-"Implementation Plan" heading. QFB extracts, assigns stable IDs (`S1`, `S2`, …), and preserves the
-original wording. It never invents or reorders steps; if the structure is ambiguous it tells you and
-asks for approval of a corrected plan.
+implementation plan** under an "Implementation Plan" heading, in any of these shapes:
+
+- numbered list items (`1.`, `2)`),
+- task checkboxes (`- [ ]`), or
+- **`### Step N — …` heading-delimited steps** (each step is a sub-heading plus its body).
+
+During the **preparation phase** (`qfb init`), QFB reads the doc and normalizes it into its own
+canonical manifest: it assigns stable IDs (`S1`, `S2`, …), preserves the original wording verbatim,
+and keeps the order unchanged. It never invents or reorders steps; if the structure is ambiguous it
+tells you and asks you to adjust the design and re-init. Inspect the normalized manifest with
+`qfb plan RUN_ID` before approving. The manifest lives only in QFB's artifact store, never in the
+QuestDB checkout.
 
 See [`../examples/sample-design.md`](../examples/sample-design.md).
 

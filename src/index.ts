@@ -44,6 +44,7 @@ Usage:
   qfb doctor [--repo PATH]
   qfb init --repo PATH --design PATH --base REF [--deny a,b,c] [--commit] [--strict] [--level N]
   qfb approve RUN_ID
+  qfb plan RUN_ID
   qfb run RUN_ID
   qfb status RUN_ID
   qfb pause RUN_ID
@@ -87,16 +88,25 @@ async function main(): Promise<void> {
           ...(typeof flags.level === "string" ? { reviewLevel: Number(flags.level) as 0 | 1 | 2 | 3 } : {}),
         },
       });
-      process.stdout.write(`Created ${res.runId} with ${res.steps} step(s).\n`);
-      if (res.ambiguous) process.stdout.write(`! Plan is ambiguous — review and re-run init.\n`);
+      process.stdout.write(`Created ${res.runId} with ${res.steps} step(s) [strategy: ${res.strategy}].\n`);
+      process.stdout.write(`Prepared plan manifest: ${res.preparedPlanPath}\n`);
+      if (res.ambiguous) process.stdout.write(`! Plan is ambiguous — edit the design and re-run init.\n`);
       for (const n of res.notes) process.stdout.write(`  note: ${n}\n`);
-      process.stdout.write(`Next: qfb approve ${res.runId}\n`);
+      process.stdout.write(`Next: review the manifest (qfb plan ${res.runId}), then qfb approve ${res.runId}\n`);
       break;
     }
     case "approve":
       ctl.approve(requireId(_));
       process.stdout.write(`Approved ${_[1]}. Next: qfb run ${_[1]}\n`);
       break;
+    case "plan": {
+      const st = ctl.status(requireId(_));
+      const p = st.preparedPlanPath as string | null;
+      if (!p) { process.stdout.write(`No prepared plan for ${_[1]}.\n`); break; }
+      const { readFileSync } = await import("node:fs");
+      process.stdout.write(readFileSync(p, "utf8"));
+      break;
+    }
     case "run": {
       const state = await ctl.run(requireId(_));
       process.stdout.write(`Run ${_[1]} settled in state: ${state}\n`);

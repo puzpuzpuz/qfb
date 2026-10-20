@@ -7,7 +7,8 @@ import type { StateName } from "./types.ts";
  * restricted exits. The controller — never the LLM — owns these rules.
  */
 const TRANSITIONS: Record<StateName, StateName[]> = {
-  [State.CREATED]: [State.AWAITING_APPROVAL],
+  [State.CREATED]: [State.PREPARING],
+  [State.PREPARING]: [State.AWAITING_APPROVAL],
   [State.AWAITING_APPROVAL]: [State.READY],
   [State.READY]: [State.IMPLEMENTING, State.HARDENING_IDENTIFY, State.REVIEWING],
   [State.IMPLEMENTING]: [State.VERIFYING_STEP, State.HARDENING_IDENTIFY],

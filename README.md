@@ -54,11 +54,13 @@ No compilation is required to run — `node src/index.ts <cmd>` works directly.
 # 0. Preflight: Pi, Herdr, skills, subagents, execution-mode compatibility
 qfb doctor --repo /path/to/questdb
 
-# 1. Create a run + a frozen, numbered plan manifest extracted from the design doc
+# 1. Preparation phase: read the design/handoff doc and normalize it into QFB's
+#    canonical plan manifest (stored in QFB's artifact dir, never the checkout)
 qfb init --repo /path/to/questdb --design ./feature-design.md --base origin/master \
          --deny "AcmeCorp,customer orders,trade_events"
 
-# 2. Review the extracted steps, then approve (freezes the design hash)
+# 2. Review the normalized manifest, then approve (freezes the design hash)
+qfb plan   run-xxxxxxxx     # the normalized, numbered manifest QFB will execute
 qfb status run-xxxxxxxx
 qfb approve run-xxxxxxxx
 
@@ -79,6 +81,7 @@ See [`examples/`](examples/) for a sample design document and configuration.
 
 | Phase | State(s) | What happens |
 |-------|----------|--------------|
+| **Preparation** | `PREPARING` | QFB reads the design/handoff doc and normalizes it into its canonical plan manifest, preserving original wording and order. Supports numbered lists, task checkboxes, **and `### Step N` heading-delimited plans**. The manifest is written to QFB's artifact store (never the checkout) and shown for approval. |
 | **B — Implementation** | `IMPLEMENTING → VERIFYING_STEP → CHECKPOINTING` | One fresh Pi session per plan step. The controller mechanically gates the result, then checkpoints. One writer at a time. |
 | **C — Hardening** | `HARDENING_IDENTIFY → HARDENING_WRITE_TESTS → HARDENING_FIX_BUGS` | Fresh sessions identify coverage gaps, write adversarial/fuzz/concurrency/fault-injection tests, and fix the bugs those tests expose. Bugs are recorded, not silently fixed; exposing tests are preserved. |
 | **D — Stabilization** | `REVIEWING → FIXING → VERIFYING_FIX → REVIEWING …` | QuestDB's `review-pr` runs against the cumulative diff; blocking findings go to `fix-pr`; loop until an acceptable verdict with passing test gate. |
@@ -106,6 +109,7 @@ An agent's `DONE` is a **claim, not a result** — it is only an input to the ga
 |---------|---------|
 | `qfb doctor [--repo PATH]` | Check Pi, Herdr, skills, subagents, credentials, execution-mode compatibility. |
 | `qfb init --repo PATH --design PATH --base REF [--deny a,b] [--commit] [--strict] [--level N]` | Create a run; extract + freeze the plan manifest. |
+| `qfb plan RUN_ID` | Print the normalized plan manifest produced by the preparation phase. |
 | `qfb approve RUN_ID` | Approve the frozen design + plan (freezes the design hash). |
 | `qfb run RUN_ID` | Execute the workflow to its next natural stopping point. |
 | `qfb status RUN_ID` | Phase, step progress, session, Git state, blockers, review iteration. |

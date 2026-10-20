@@ -44,6 +44,43 @@ test("plan: ambiguous when no steps found", () => {
   assert.equal(ambiguous, true);
 });
 
+test("plan: extracts heading-delimited '### Step N' steps and preserves wording", () => {
+  const doc = `# Handoff
+
+## Implementation plan
+
+Some preamble prose that is not a step.
+
+### Step 0 — baseline (no code)
+- Read the templates.
+- Confirm the repro.
+
+### Step 1 — add ROWS codec
+- Mirror avg's ROWS methods.
+- Gate: lv package green.
+
+### Commit granularity
+Not a step; must be ignored.
+`;
+  const { steps, ambiguous, strategy } = extractPlan(doc);
+  assert.equal(ambiguous, false);
+  assert.equal(strategy, "heading");
+  assert.deepEqual(steps.map((s) => s.id), ["S1", "S2"]);
+  assert.match(steps[0]!.text, /Step 0 \u2014 baseline/);
+  assert.match(steps[0]!.text, /Read the templates/);
+  assert.match(steps[1]!.text, /add ROWS codec/);
+  // The trailing non-step heading is not captured as a step.
+  assert.ok(!steps.some((s) => /Commit granularity/.test(s.text)));
+});
+
+test("plan: normalized manifest lists each step under its stable id", () => {
+  const doc = "## Implementation plan\n\n### Step 1 — do a thing\n- detail\n";
+  const { normalizedMarkdown } = extractPlan(doc);
+  assert.match(normalizedMarkdown, /# QFB Prepared Plan/);
+  assert.match(normalizedMarkdown, /## S1/);
+  assert.match(normalizedMarkdown, /do a thing/);
+});
+
 test("report: parses structured block and selects findings by policy", () => {
   const raw = "intro\n```qfb-review\n" +
     JSON.stringify({ verdict: "blocking", testGatePassed: true, findings: [

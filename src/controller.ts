@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Store } from "./store.ts";
@@ -60,7 +60,21 @@ export class Controller {
   }
 
   // ---------------------------------------------------------------- init
-  init(opts: InitOptions): { runId: string; ambiguous: boolean; notes: string[]; steps: number } {
+  /**
+   * Create a run and run the PREPARATION phase: read the design/handoff doc,
+   * normalize it into QFB's canonical plan manifest (preserving wording and
+   * order), write that manifest to QFB's own artifact store (never the
+   * checkout), and extract the ordered steps. The developer approves the
+   * normalized manifest before it is frozen.
+   */
+  init(opts: InitOptions): {
+    runId: string;
+    ambiguous: boolean;
+    notes: string[];
+    steps: number;
+    strategy: string;
+    preparedPlanPath: string;
+  } {
     const runId = `run-${randomUUID().slice(0, 8)}`;
     const design = readFileSync(opts.designPath, "utf8");
     const designHash = sha256(design);
@@ -82,11 +96,31 @@ export class Controller {
       denyList: opts.denyList ?? [],
       stopReason: null,
     });
-    this.store.insertSteps(runId, extraction.steps);
     this.store.recordTransition(runId, null, State.CREATED, "init");
-    this.transition(runId, State.CREATED, State.AWAITING_APPROVAL, "init-complete");
-    this.artifactDir(runId); // ensure exists
-    return { runId, ambiguous: extraction.ambiguous, notes: extraction.notes, steps: extraction.steps.length };
+
+    // --- Preparation phase ---
+    this.transition(runId, State.CREATED, State.PREPARING, "prepare");
+    const preparedPlanPath = this.artifactPath(runId, "prepared-plan.md");
+    const header =
+      `<!-- QFB prepared plan for ${runId} -->\n` +
+      `<!-- source design/handoff: ${opts.designPath} -->\n` +
+      `<!-- approve with: qfb approve ${runId} -->\n\n`;
+    writeFileSync(preparedPlanPath, header + extraction.normalizedMarkdown);
+    this.store.setCounter(runId, "prepared-plan-path", preparedPlanPath);
+    this.store.setCounter(runId, "plan-strategy", extraction.strategy);
+    this.store.insertSteps(runId, extraction.steps);
+
+    this.transition(runId, State.PREPARING, State.AWAITING_APPROVAL, "prepared",
+      JSON.stringify({ strategy: extraction.strategy, steps: extraction.steps.length }));
+
+    return {
+      runId,
+      ambiguous: extraction.ambiguous,
+      notes: extraction.notes,
+      steps: extraction.steps.length,
+      strategy: extraction.strategy,
+      preparedPlanPath,
+    };
   }
 
   approve(runId: string): void {
@@ -472,6 +506,8 @@ export class Controller {
       branch: run.branch,
       baseRef: run.baseRef,
       stopReason: run.stopReason,
+      preparedPlanPath: this.store.getCounter(runId, "prepared-plan-path"),
+      planStrategy: this.store.getCounter(runId, "plan-strategy"),
       steps: steps.map((s) => ({ id: s.id, status: s.status, attempts: s.attempts, text: s.text.split("\n")[0] })),
       stepsDone: steps.filter((s) => s.status === "done").length,
       stepsTotal: steps.length,
