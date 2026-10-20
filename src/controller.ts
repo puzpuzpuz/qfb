@@ -3,6 +3,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Store } from "./store.ts";
+import type { PaneLabel } from "./adapters/herdr.ts";
+import type { PiLaunchResult } from "./adapters/pi.ts";
 import { assertTransition } from "./stateMachine.ts";
 import { extractPlan } from "./plan.ts";
 import { mechanicalGate } from "./gating.ts";
@@ -19,7 +21,10 @@ export interface GitLike {
   branch(): string;
   head(): string;
   snapshot(base: string): GitSnapshot;
-  stagedDiff(): string;
+  /** Git-derived list of paths changed vs base (tracked + untracked). */
+  changedFiles(base: string): string[];
+  /** Git-derived diff content vs base (tracked diff + untracked contents). */
+  workingDiff(base: string): string;
   isClean(): boolean;
   commitCheckpoint(message: string, files: string[]): string;
 }
@@ -198,6 +203,14 @@ export class Controller {
       case State.VERIFYING_FIX:
         this.transition(runId, State.VERIFYING_FIX, State.REVIEWING, "fix-verified");
         return;
+      case State.VERIFYING_STEP:
+      case State.CHECKPOINTING:
+        // Crash recovery: these are transient intra-step states that are only
+        // ever persisted if the process died mid-step. Re-enter the
+        // implementation loop; the step re-runs idempotently (bounded by its
+        // attempt budget) rather than wedging the run.
+        this.transition(runId, run.state, State.IMPLEMENTING, "crash-recovery");
+        return;
       default:
         throw new Error(`advance() called in non-actionable state ${run.state}`);
     }
@@ -223,19 +236,17 @@ export class Controller {
     const artifactPath = this.artifactPath(runId, `${next.id}-attempt${attempts}.json`);
     const sessionId = `${runId}-${next.id}-a${attempts}`;
 
-    const pane = await this.herdr.ensurePane({ feature: runId, phase: "IMPLEMENTING", stepId: next.id });
-    const sessionRow = this.store.recordSession(runId, next.id, "implementation", sessionId, pane, artifactPath);
-
-    const result = await this.pi.launch({
+    const result = await this.runAgentSession({
       runId,
       stepId: next.id,
-      cwd: run.repoPath,
+      kind: "implementation",
       sessionId,
       artifactPath,
-      inactivityTimeoutMs: run.config.sessionInactivityTimeoutMs,
+      label: { feature: runId, phase: "IMPLEMENTING", stepId: next.id },
+      cwd: run.repoPath,
+      timeoutMs: run.config.sessionInactivityTimeoutMs,
       prompt: this.buildStepPrompt(run.designPath, next, completed, artifactPath),
     });
-    this.store.endSession(sessionRow, result.artifact?.status ?? "unknown");
 
     const after = git.snapshot(run.baseRef);
     const gate = mechanicalGate({
@@ -246,7 +257,8 @@ export class Controller {
       expectedBranch: run.branch,
       allowedPathPrefixes: [],
       denyList: run.denyList,
-      stagedDiff: safe(() => git.stagedDiff(), ""),
+      changedFiles: safe(() => git.changedFiles(run.baseRef), result.artifact?.changedFiles ?? []),
+      diffText: safe(() => git.workingDiff(run.baseRef), ""),
     });
 
     this.transition(runId, State.IMPLEMENTING, State.VERIFYING_STEP, "session-settled",
@@ -299,21 +311,18 @@ export class Controller {
   // ------------------------------------------------- Phase C: hardening
   private async doHardening(runId: string): Promise<void> {
     const run = this.requireRun(runId);
-    const git = this.makeGit(run.repoPath);
     const stage = run.state;
     const stageKey = stage === State.HARDENING_IDENTIFY ? "identify" : stage === State.HARDENING_WRITE_TESTS ? "write" : "fix";
     const pass = this.store.getNumber(runId, "hardening-pass");
 
     const artifactPath = this.artifactPath(runId, `hardening-${stageKey}-p${pass}.json`);
     const sessionId = `${runId}-harden-${stageKey}-p${pass}`;
-    const pane = await this.herdr.ensurePane({ feature: runId, phase: stage, stepId: stageKey });
-    const sessionRow = this.store.recordSession(runId, stageKey, `hardening-${stageKey}`, sessionId, pane, artifactPath);
-    const result = await this.pi.launch({
-      runId, stepId: stageKey, cwd: run.repoPath, sessionId, artifactPath,
-      inactivityTimeoutMs: run.config.sessionInactivityTimeoutMs,
+    const result = await this.runAgentSession({
+      runId, stepId: stageKey, kind: `hardening-${stageKey}`, sessionId, artifactPath,
+      label: { feature: runId, phase: stage, stepId: stageKey },
+      cwd: run.repoPath, timeoutMs: run.config.sessionInactivityTimeoutMs,
       prompt: this.buildHardeningPrompt(run.designPath, stage, artifactPath),
     });
-    this.store.endSession(sessionRow, result.artifact?.status ?? "unknown");
 
     // Each stage must produce a verified typed handoff before the next begins.
     if (!result.artifact) {
@@ -389,14 +398,12 @@ export class Controller {
 
     const artifactPath = this.artifactPath(runId, `review-${iteration}.json`);
     const sessionId = `${runId}-review-${iteration}`;
-    const pane = await this.herdr.ensurePane({ feature: runId, phase: "REVIEWING", stepId: "review", reviewIteration: iteration });
-    const sessionRow = this.store.recordSession(runId, "review", "review", sessionId, pane, artifactPath);
-    const result = await this.pi.launch({
-      runId, stepId: "review", cwd: run.repoPath, sessionId, artifactPath,
-      inactivityTimeoutMs: run.config.sessionInactivityTimeoutMs,
+    const result = await this.runAgentSession({
+      runId, stepId: "review", kind: "review", sessionId, artifactPath,
+      label: { feature: runId, phase: "REVIEWING", stepId: "review", reviewIteration: iteration },
+      cwd: run.repoPath, timeoutMs: run.config.sessionInactivityTimeoutMs,
       prompt: this.buildReviewPrompt(run.baseRef, run.config.reviewLevel, artifactPath),
     });
-    this.store.endSession(sessionRow, result.artifact?.status ?? "unknown");
 
     if (!result.artifact?.reviewReportPath || !existsSync(result.artifact.reviewReportPath)) {
       throw new PauseSignal("Review session did not preserve a raw review-pr report.");
@@ -431,8 +438,19 @@ export class Controller {
       return;
     }
 
+    // Not acceptable, but nothing is mechanically fixable: the test gate failed
+    // or the only findings are non-actionable (e.g. adjacent). Entering fix-pr
+    // with an empty authorized set would spin pointlessly \u2014 require a human.
+    const actionable = selectActionableFindings(report, run.config.strictReviewPolicy);
+    if (actionable.length === 0) {
+      const why = !report.testGatePassed
+        ? "the review test gate failed"
+        : "the review is not acceptable but produced no actionable findings";
+      throw new PauseSignal(`Cannot auto-remediate: ${why}; a human decision is required.`);
+    }
+
     // No-progress detection over finding identity (Section 8.2).
-    const ids = selectActionableFindings(report, run.config.strictReviewPolicy).map(findingIdentity);
+    const ids = actionable.map(findingIdentity);
     const history = JSON.parse(this.store.getCounter(runId, "finding-identity-history") ?? "[]") as string[][];
     const survivors = detectNoProgress(history, ids, run.config.maxNoProgress);
     history.push(ids);
@@ -443,7 +461,7 @@ export class Controller {
     }
 
     // Stash selected findings for the fix session, then transition.
-    this.store.setCounter(runId, "pending-findings", JSON.stringify(selectActionableFindings(report, run.config.strictReviewPolicy)));
+    this.store.setCounter(runId, "pending-findings", JSON.stringify(actionable));
     this.transition(runId, State.REVIEWING, State.FIXING, "blocking-findings");
   }
 
@@ -453,14 +471,12 @@ export class Controller {
     const iteration = this.store.getReviews(runId).length;
     const artifactPath = this.artifactPath(runId, `fix-${iteration}.json`);
     const sessionId = `${runId}-fix-${iteration}`;
-    const pane = await this.herdr.ensurePane({ feature: runId, phase: "FIXING", stepId: "fix", reviewIteration: iteration });
-    const sessionRow = this.store.recordSession(runId, "fix", "fix", sessionId, pane, artifactPath);
-    const result = await this.pi.launch({
-      runId, stepId: "fix", cwd: run.repoPath, sessionId, artifactPath,
-      inactivityTimeoutMs: run.config.sessionInactivityTimeoutMs,
+    const result = await this.runAgentSession({
+      runId, stepId: "fix", kind: "fix", sessionId, artifactPath,
+      label: { feature: runId, phase: "FIXING", stepId: "fix", reviewIteration: iteration },
+      cwd: run.repoPath, timeoutMs: run.config.sessionInactivityTimeoutMs,
       prompt: this.buildFixPrompt(findings, artifactPath),
     });
-    this.store.endSession(sessionRow, result.artifact?.status ?? "unknown");
 
     const outcome = result.artifact?.fixOutcome;
     if (outcome !== FixOutcome.CLEAN) {
@@ -561,6 +577,55 @@ export class Controller {
   }
 
   // ---------------------------------------------------------------- helpers
+  /**
+   * Record and launch one agent session, with crash-resume idempotency. If a
+   * prior session with this exact deterministic id already ended and left its
+   * typed artifact on disk (i.e. the process died after the agent finished but
+   * before the controller acted), reuse that artifact instead of recording and
+   * launching a duplicate session.
+   */
+  private async runAgentSession(opts: {
+    runId: string;
+    stepId: string;
+    kind: string;
+    sessionId: string;
+    artifactPath: string;
+    label: PaneLabel;
+    cwd: string;
+    timeoutMs: number;
+    prompt: string;
+  }): Promise<PiLaunchResult> {
+    const prior = this.store.findSessionBySessionId(opts.sessionId);
+    if (prior && prior.ended_at && existsSync(opts.artifactPath)) {
+      try {
+        const artifact = JSON.parse(readFileSync(opts.artifactPath, "utf8")) as TaskArtifact;
+        return {
+          sessionId: opts.sessionId,
+          settled: true,
+          exitCode: 0,
+          timedOut: false,
+          artifact,
+          transcriptPath: `${opts.artifactPath}.transcript.log`,
+        };
+      } catch {
+        // Corrupt/partial artifact \u2014 fall through and relaunch cleanly.
+      }
+    }
+    const pane = await this.herdr.ensurePane(opts.label);
+    const sessionRow = this.store.recordSession(opts.runId, opts.stepId, opts.kind, opts.sessionId, pane, opts.artifactPath);
+    const result = await this.pi.launch({
+      runId: opts.runId,
+      stepId: opts.stepId,
+      cwd: opts.cwd,
+      sessionId: opts.sessionId,
+      artifactPath: opts.artifactPath,
+      inactivityTimeoutMs: opts.timeoutMs,
+      prompt: opts.prompt,
+    });
+    this.store.endSession(sessionRow, result.artifact?.status ?? "unknown");
+    return result;
+  }
+
   private stopRun(runId: string, state: StateName, reason: string): StateName {
     const run = this.requireRun(runId);
     this.store.setStopReason(runId, reason);

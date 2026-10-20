@@ -25,6 +25,13 @@ function parseArgs(argv: string[]): Args {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a.startsWith("--")) {
+      // Support `--key=value` so values may themselves begin with `--`
+      // (e.g. --pr-title=--wip) without being misread as another flag.
+      const eq = a.indexOf("=");
+      if (eq !== -1) {
+        flags[a.slice(2, eq)] = a.slice(eq + 1);
+        continue;
+      }
       const key = a.slice(2);
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith("--")) {

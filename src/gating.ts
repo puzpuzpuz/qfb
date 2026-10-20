@@ -24,8 +24,21 @@ export interface GateInput {
   allowedPathPrefixes: string[];
   /** Frozen confidentiality deny-list. */
   denyList: string[];
-  /** Staged diff text to scan for confidentiality leaks and forbidden files. */
-  stagedDiff: string;
+  /**
+   * Authoritative, git-derived list of paths changed in the working tree
+   * versus the feature base (tracked modifications + untracked files). This is
+   * computed by the controller from git itself — NOT taken from the agent's
+   * self-reported `artifact.changedFiles` — so scope and confidentiality are
+   * gated on evidence QFB can verify.
+   */
+  changedFiles: string[];
+  /**
+   * Authoritative diff content to scan for confidentiality leaks: the
+   * working-tree diff against base plus untracked file contents. (Scanning the
+   * *staged* diff would be empty under the default snapshot policy, where
+   * nothing is ever staged.)
+   */
+  diffText: string;
 }
 
 export interface GateResult {
@@ -78,8 +91,9 @@ export function mechanicalGate(input: GateInput): GateResult {
     );
   }
 
-  // Scope: only allowed paths may change.
-  const changed = input.artifact?.changedFiles ?? [];
+  // Scope: only allowed paths may change. Enumerated from git, not the agent's
+  // self-report, so an under-reported changeset cannot slip past the gate.
+  const changed = input.changedFiles;
   for (const file of changed) {
     for (const re of FORBIDDEN_PATHS) {
       if (re.test(file)) {
@@ -96,9 +110,10 @@ export function mechanicalGate(input: GateInput): GateResult {
     }
   }
 
-  // Confidentiality deny-list (Section 7.1): scan staged diff and changed names.
+  // Confidentiality deny-list (Section 7.1): scan the real working-tree diff
+  // content (plus untracked file contents) and the git-derived changed names.
   const denyMatches = scanForDenyTerms(
-    input.stagedDiff + "\n" + changed.join("\n"),
+    input.diffText + "\n" + changed.join("\n"),
     input.denyList,
   );
   if (denyMatches.length > 0) {

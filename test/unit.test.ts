@@ -128,35 +128,40 @@ test("stateMachine: rejects invalid transitions, allows orthogonal entry", () =>
 test("gating: passes clean DONE step", () => {
   const r = mechanicalGate({
     artifact: art(), sessionCompleted: true, before: snap(), after: snap(),
-    expectedBranch: "feature/x", allowedPathPrefixes: [], denyList: [], stagedDiff: "",
+    expectedBranch: "feature/x", allowedPathPrefixes: [], denyList: [],
+    changedFiles: ["src/Foo.java"], diffText: "",
   });
   assert.equal(r.passed, true);
 });
 
 test("gating: fails on missing artifact, failed test, and dirty scope", () => {
-  assert.equal(mechanicalGate({ artifact: null, sessionCompleted: true, before: snap(), after: snap(), expectedBranch: "feature/x", allowedPathPrefixes: [], denyList: [], stagedDiff: "" }).passed, false);
+  assert.equal(mechanicalGate({ artifact: null, sessionCompleted: true, before: snap(), after: snap(), expectedBranch: "feature/x", allowedPathPrefixes: [], denyList: [], changedFiles: [], diffText: "" }).passed, false);
 
   const failedTest = mechanicalGate({
     artifact: art({ testCommands: [{ command: "mvn test", exitCode: 1, logPath: "/l" }] }),
     sessionCompleted: true, before: snap(), after: snap(), expectedBranch: "feature/x",
-    allowedPathPrefixes: [], denyList: [], stagedDiff: "",
+    allowedPathPrefixes: [], denyList: [], changedFiles: ["src/Foo.java"], diffText: "",
   });
   assert.equal(failedTest.passed, false);
 
+  // Scope is enforced from the GIT-DERIVED changeset, not the agent's report:
+  // the forbidden handoff file is present in git even though the artifact omits it.
   const scope = mechanicalGate({
-    artifact: art({ changedFiles: ["src/Foo.java", "handoff.md"] }),
+    artifact: art({ changedFiles: ["src/Foo.java"] }),
     sessionCompleted: true, before: snap(), after: snap(), expectedBranch: "feature/x",
-    allowedPathPrefixes: [], denyList: [], stagedDiff: "",
+    allowedPathPrefixes: [], denyList: [], changedFiles: ["src/Foo.java", "handoff.md"], diffText: "",
   });
   assert.equal(scope.passed, false);
   assert.equal(scope.pause, true);
 });
 
-test("gating: confidentiality leak pauses the gate", () => {
+test("gating: confidentiality leak in working-tree diff content pauses the gate", () => {
+  // The deny-listed term appears only in the diff CONTENT (not a file name and
+  // not in the agent's self-reported changedFiles) \u2014 it must still be caught.
   const r = mechanicalGate({
     artifact: art(), sessionCompleted: true, before: snap(), after: snap(),
     expectedBranch: "feature/x", allowedPathPrefixes: [], denyList: ["AcmeCorp"],
-    stagedDiff: "+ // for AcmeCorp rollout",
+    changedFiles: ["src/Foo.java"], diffText: "+ // for AcmeCorp rollout",
   });
   assert.equal(r.passed, false);
   assert.equal(r.pause, true);
@@ -166,7 +171,7 @@ test("gating: submodule drift fails", () => {
   const r = mechanicalGate({
     artifact: art(), sessionCompleted: true, before: snap({ submoduleHead: "sub0" }),
     after: snap({ submoduleHead: "sub1" }), expectedBranch: "feature/x",
-    allowedPathPrefixes: [], denyList: [], stagedDiff: "",
+    allowedPathPrefixes: [], denyList: [], changedFiles: ["src/Foo.java"], diffText: "",
   });
   assert.equal(r.passed, false);
 });

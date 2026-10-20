@@ -1,6 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { GitSnapshot } from "./types.ts";
+
+/** Cap on how much of each untracked file we read when scanning for leaks. */
+const MAX_UNTRACKED_SCAN_BYTES = 512 * 1024;
 
 /**
  * Thin, read-mostly Git wrapper enforcing the safety rules of Section 7.
@@ -87,6 +92,58 @@ export class Git {
 
   stagedDiff(): string {
     return this.run(["diff", "--cached"]);
+  }
+
+  /**
+   * Authoritative list of paths changed versus `base`: tracked modifications
+   * (working tree vs base) plus untracked files. Used by the mechanical gate
+   * for scope/confidentiality instead of the agent's self-report.
+   */
+  changedFiles(base: string): string[] {
+    let tracked: string[] = [];
+    try {
+      const out = this.run(["diff", "--name-only", base]);
+      tracked = out ? out.split("\n") : [];
+    } catch {
+      try {
+        const out = this.run(["diff", "--name-only"]);
+        tracked = out ? out.split("\n") : [];
+      } catch {
+        tracked = [];
+      }
+    }
+    return [...new Set([...tracked, ...this.untrackedFiles()])].filter(Boolean);
+  }
+
+  /**
+   * Authoritative diff CONTENT to scan for confidentiality leaks: the
+   * working-tree diff against base (tracked changes) plus the contents of
+   * untracked text files (new files the agent created but has not staged).
+   */
+  workingDiff(base: string): string {
+    let diff = "";
+    try {
+      diff = this.run(["diff", base]);
+    } catch {
+      try {
+        diff = this.run(["diff"]);
+      } catch {
+        diff = "";
+      }
+    }
+    const parts = [diff];
+    for (const f of this.untrackedFiles()) {
+      try {
+        const abs = join(this.cwd, f);
+        if (statSync(abs).size > MAX_UNTRACKED_SCAN_BYTES) continue;
+        const content = readFileSync(abs);
+        if (content.includes(0)) continue; // skip binary files
+        parts.push(`--- untracked: ${f} ---\n${content.toString("utf8")}`);
+      } catch {
+        // unreadable/removed between listing and read \u2014 skip
+      }
+    }
+    return parts.join("\n");
   }
 
   /**

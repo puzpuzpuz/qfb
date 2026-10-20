@@ -15,7 +15,8 @@ export class FakeGit implements GitLike {
     head: "deadbeef",
     fingerprint: "fp0",
     submoduleHead: "sub0" as string | null,
-    stagedDiff: "",
+    changedFiles: [] as string[],
+    diffText: "",
   };
   branch() {
     return this.state.branch;
@@ -32,8 +33,11 @@ export class FakeGit implements GitLike {
       untrackedFiles: [],
     };
   }
-  stagedDiff() {
-    return this.state.stagedDiff;
+  changedFiles(_base: string) {
+    return this.state.changedFiles;
+  }
+  workingDiff(_base: string) {
+    return this.state.diffText;
   }
   isClean() {
     return this.state.fingerprint === "fp0";

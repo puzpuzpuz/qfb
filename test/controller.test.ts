@@ -267,6 +267,53 @@ test("statusDetails reports the current session and recent transitions", async (
   assert.ok(d.recentTransitions.every((t) => typeof t.at === "string" && t.at.length > 0));
 });
 
+test("crash in an intermediate step state (VERIFYING_STEP) is resumable, not wedged", async () => {
+  // Simulate a crash that persisted a transient intra-step state.
+  const h = makeHarness(THREE_STEP_DESIGN, []);
+  const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b" });
+  h.controller.approve(runId);
+  // Drive to READY->IMPLEMENTING, then clobber the state as a crash would.
+  h.store.setState(runId, "VERIFYING_STEP" as never);
+  // Queue the full happy path; the run must recover and complete rather than throw.
+  h.pi.push(implDone("S1")); h.pi.push(implDone("S2")); h.pi.push(implDone("S3"));
+  for (const x of HAPPY_HARDENING) h.pi.push(x);
+  h.pi.push(review(APPROVED));
+  const state = await h.controller.run(runId);
+  assert.equal(state, "COMPLETED");
+  assert.equal(h.controller.status(runId).stepsDone, 3);
+});
+
+test("confidentiality is gated on the git-derived diff, not the agent's self-report", async () => {
+  // The agent claims DONE and reports an innocuous changedFiles list, but the
+  // real working-tree diff (from git) leaks a deny-listed customer name.
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    (_req, git) => {
+      git.state.fingerprint = "leaky";
+      git.state.changedFiles = ["src/Orders.java"];
+      git.state.diffText = "+ // migrate AcmeCorp orders\n";
+      return { artifact: artifact({ stepId: "S1", status: "DONE", changedFiles: ["src/Orders.java"] }) };
+    },
+  ]);
+  const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b", denyList: ["AcmeCorp"] });
+  h.controller.approve(runId);
+  const state = await h.controller.run(runId);
+  assert.equal(state, "paused");
+  assert.match(String(h.controller.status(runId).stopReason), /confidentiality/i);
+});
+
+test("review that is unacceptable with no actionable findings pauses for a human", async () => {
+  // Verdict approved but the test gate failed: nothing for fix-pr to act on.
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING,
+    review({ verdict: "approved", testGatePassed: false, findings: [] }),
+  ]);
+  const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b" });
+  h.controller.approve(runId);
+  const state = await h.controller.run(runId);
+  assert.equal(state, "paused");
+  assert.match(String(h.controller.status(runId).stopReason), /human decision/i);
+});
+
 test("findRun locates an existing run for the same repo/design/base (resumption key)", () => {
   const h = makeHarness(THREE_STEP_DESIGN, []);
   const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "base-ref" });
