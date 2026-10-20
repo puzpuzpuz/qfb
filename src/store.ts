@@ -282,6 +282,14 @@ export class Store {
     return this.db.prepare("SELECT * FROM sessions WHERE run_id = ? ORDER BY id").all(runId) as Record<string, unknown>[];
   }
 
+  getLatestSession(runId: string): Record<string, unknown> | null {
+    return (
+      (this.db.prepare("SELECT * FROM sessions WHERE run_id = ? ORDER BY id DESC LIMIT 1").get(runId) as
+        | Record<string, unknown>
+        | undefined) ?? null
+    );
+  }
+
   // ---- Checkpoints ----
   recordCheckpoint(runId: string, stepId: string, gitHead: string, fingerprint: string): void {
     this.db

@@ -517,6 +517,49 @@ export class Controller {
     };
   }
 
+  /**
+   * Extra, human-oriented detail for `status --verbose`: the current/last Pi
+   * session (id, kind, step, status, transcript path) and the recent phase
+   * transitions with timestamps.
+   */
+  statusDetails(runId: string, transitionLimit = 12): {
+    currentSession: {
+      sessionId: string;
+      kind: string;
+      stepId: string;
+      status: string | null;
+      startedAt: string | null;
+      endedAt: string | null;
+      transcriptPath: string | null;
+    } | null;
+    recentTransitions: { at: string; from: string | null; to: string; operation: string }[];
+  } {
+    this.requireRun(runId);
+    const s = this.store.getLatestSession(runId);
+    const artifactPath = (s?.artifact_path as string | undefined) ?? null;
+    const currentSession = s
+      ? {
+          sessionId: s.session_id as string,
+          kind: s.kind as string,
+          stepId: s.step_id as string,
+          status: (s.status as string | null) ?? null,
+          startedAt: (s.started_at as string | null) ?? null,
+          endedAt: (s.ended_at as string | null) ?? null,
+          transcriptPath: artifactPath ? `${artifactPath}.transcript.log` : null,
+        }
+      : null;
+    const recentTransitions = this.store
+      .getTransitions(runId)
+      .slice(-transitionLimit)
+      .map((t) => ({
+        at: t.created_at as string,
+        from: (t.from_state as string | null) ?? null,
+        to: t.to_state as string,
+        operation: t.operation as string,
+      }));
+    return { currentSession, recentTransitions };
+  }
+
   // ---------------------------------------------------------------- helpers
   private stopRun(runId: string, state: StateName, reason: string): StateName {
     const run = this.requireRun(runId);

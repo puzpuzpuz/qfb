@@ -249,6 +249,24 @@ test("build-style run is interruptible and resumes without duplicating completed
   assert.equal(h.pi.launches.filter((l) => /-S1-/.test(l.sessionId)).length, 1);
 });
 
+test("statusDetails reports the current session and recent transitions", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING, review(APPROVED),
+  ]);
+  const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b" });
+  h.controller.approve(runId);
+  await h.controller.run(runId);
+
+  const d = h.controller.statusDetails(runId);
+  assert.ok(d.currentSession, "expected a current session");
+  assert.equal(d.currentSession!.kind, "review");
+  assert.match(d.currentSession!.transcriptPath ?? "", /\.transcript\.log$/);
+  // Transitions include the preparation and completion milestones.
+  const tos = d.recentTransitions.map((t) => t.to);
+  assert.ok(tos.includes("COMPLETED"));
+  assert.ok(d.recentTransitions.every((t) => typeof t.at === "string" && t.at.length > 0));
+});
+
 test("findRun locates an existing run for the same repo/design/base (resumption key)", () => {
   const h = makeHarness(THREE_STEP_DESIGN, []);
   const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "base-ref" });

@@ -106,9 +106,15 @@ or no-progress condition is hit.
 ## 5. Monitor
 
 ```bash
-qfb status run-xxxxxxxx     # phase, step progress, session count, reviews, checkpoints, blockers
-qfb logs   run-xxxxxxxx     # where transcripts, test logs, and review/fix reports live
+qfb status run-xxxxxxxx             # phase, step progress, session count, reviews, checkpoints, blockers
+qfb status run-xxxxxxxx --verbose   # also: current Pi session (id/kind/step), a tail of its live
+                                    # transcript, and the recent phase transitions with timestamps
+qfb logs   run-xxxxxxxx             # the artifact dir: per-session *.transcript.log, typed *.json
+                                    # handoffs, and review/fix reports
 ```
+
+Each live Pi session streams its stdout/stderr to `<artifact>.transcript.log`, so
+`tail -f ~/.local/state/qfb/artifacts/<run-id>/*.transcript.log` gives you the raw agent output.
 
 If Herdr is active, panes are labelled with the feature, phase, step ID, and review iteration so you
 can watch live. Remember: a pane going idle is **not** proof of completion.

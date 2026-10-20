@@ -1,5 +1,6 @@
 #!/usr/bin/env -S node --experimental-strip-types --no-warnings
 import { createInterface } from "node:readline/promises";
+import { readFileSync } from "node:fs";
 import { Store } from "./store.ts";
 import { Controller } from "./controller.ts";
 import { Git } from "./git.ts";
@@ -85,7 +86,7 @@ Granular / recovery commands:
   qfb approve RUN_ID
   qfb plan RUN_ID
   qfb run RUN_ID
-  qfb status RUN_ID
+  qfb status RUN_ID [--verbose]
   qfb pause RUN_ID
   qfb resume RUN_ID
   qfb stop RUN_ID
@@ -149,9 +150,12 @@ async function main(): Promise<void> {
       process.stdout.write(JSON.stringify(ctl.status(_[1]!), null, 2) + "\n");
       break;
     }
-    case "status":
-      process.stdout.write(JSON.stringify(ctl.status(requireId(_)), null, 2) + "\n");
+    case "status": {
+      const id = requireId(_);
+      process.stdout.write(JSON.stringify(ctl.status(id), null, 2) + "\n");
+      if (flags.verbose || flags.v) printStatusDetails(ctl, id);
       break;
+    }
     case "pause":
       ctl.pause(requireId(_));
       process.stdout.write(`Paused ${_[1]}.\n`);
@@ -294,6 +298,42 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
   }
 
   out(`\n\u2713 Feature complete: ${runId}`);
+}
+
+/** Human-oriented detail for `qfb status --verbose`. */
+function printStatusDetails(ctl: Controller, runId: string): void {
+  const out = (s: string) => process.stdout.write(s + "\n");
+  const d = ctl.statusDetails(runId);
+
+  out("\n\u2500\u2500 current session \u2500\u2500");
+  if (!d.currentSession) {
+    out("  (no Pi session launched yet)");
+  } else {
+    const c = d.currentSession;
+    const live = c.endedAt ? `ended ${c.endedAt}` : "RUNNING";
+    out(`  ${c.kind}  step=${c.stepId}  status=${c.status ?? "?"}  [${live}]`);
+    out(`  session-id: ${c.sessionId}`);
+    if (c.transcriptPath) {
+      out(`  transcript: ${c.transcriptPath}`);
+      out("  \u2500 last lines \u2500");
+      for (const line of tailFile(c.transcriptPath, 15)) out(`    ${line}`);
+    }
+  }
+
+  out("\n\u2500\u2500 recent transitions \u2500\u2500");
+  if (d.recentTransitions.length === 0) out("  (none)");
+  for (const t of d.recentTransitions) {
+    out(`  ${t.at}  ${t.from ?? "\u2205"} \u2192 ${t.to}  (${t.operation})`);
+  }
+}
+
+function tailFile(path: string, n: number): string[] {
+  try {
+    const lines = readFileSync(path, "utf8").split(/\r?\n/).filter((l) => l.length > 0);
+    return lines.slice(-n);
+  } catch {
+    return ["(transcript not available yet)"];
+  }
 }
 
 function str(v: string | boolean | undefined): string | undefined {

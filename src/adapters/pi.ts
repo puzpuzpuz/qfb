@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, createWriteStream } from "node:fs";
 import type { TaskArtifact } from "../types.ts";
 
 /**
@@ -71,22 +71,45 @@ export class RpcPiAdapter implements PiAdapter {
       "--session-id", req.sessionId,
       "--name", `qfb-${req.runId}-${req.stepId}`,
     ];
-    const child = spawn("pi", args, { cwd: req.cwd });
-    child.stdin.write(req.prompt);
-    child.stdin.end();
+    const child = spawn("pi", args, { cwd: req.cwd, stdio: ["pipe", "pipe", "pipe"] });
+
+    // CRITICAL: continuously drain stdout/stderr. If we leave them unread, a
+    // verbose Pi session fills the OS pipe buffer (~64KB) and blocks forever.
+    // Draining also gives us the durable session transcript (Section 13).
+    const transcriptPath = `${req.artifactPath}.transcript.log`;
+    const transcript = createWriteStream(transcriptPath, { flags: "a" });
 
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      // Do not kill mid-write blindly; a timeout is not proof of failure
-      // (Section 11). We detach and let the controller reconcile.
-    }, req.inactivityTimeoutMs);
+    let timer: NodeJS.Timeout;
+    const resetInactivity = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        // Inactivity (no output) exceeded the budget. A timeout is not proof of
+        // failure (Section 11); we terminate so the controller can reconcile
+        // and preserve any partial work/artifact rather than hang indefinitely.
+        timedOut = true;
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+      }, req.inactivityTimeoutMs);
+    };
+    resetInactivity();
+
+    const onChunk = (buf: Buffer) => {
+      transcript.write(buf);
+      resetInactivity(); // activity seen → reset the inactivity window
+    };
+    child.stdout.on("data", onChunk);
+    child.stderr.on("data", onChunk);
+
+    child.stdin.write(req.prompt);
+    child.stdin.end();
 
     const exitCode: number | null = await new Promise((resolve) => {
       child.on("close", (code) => resolve(code));
       child.on("error", () => resolve(null));
     });
-    clearTimeout(timer);
+    clearTimeout(timer!);
+    transcript.end();
     this.running.delete(req.sessionId);
 
     const artifact = await readArtifact(req.artifactPath);
@@ -96,7 +119,7 @@ export class RpcPiAdapter implements PiAdapter {
       exitCode,
       timedOut,
       artifact,
-      transcriptPath: null,
+      transcriptPath,
     };
   }
 
