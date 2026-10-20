@@ -502,6 +502,19 @@ export class Controller {
     if (run.state === State.PAUSED) {
       this.transition(runId, State.PAUSED, State.READY, "operator-resume");
       this.store.setStopReason(runId, null);
+      return;
+    }
+    if (run.state === State.BLOCKED) {
+      // The operator has addressed the blocker. Re-open any blocked step and
+      // re-enter the implementation loop so it is retried (bounded by its
+      // attempt budget). Evidence from the blocked attempt is preserved; the
+      // step must be reset to pending or the loop would skip it and wrongly
+      // advance to hardening.
+      for (const s of this.store.getSteps(runId)) {
+        if (s.status === "blocked") this.store.setStepStatus(runId, s.id, "pending");
+      }
+      this.transition(runId, State.BLOCKED, State.IMPLEMENTING, "operator-unblock");
+      this.store.setStopReason(runId, null);
     }
   }
 

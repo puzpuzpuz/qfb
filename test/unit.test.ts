@@ -1,5 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Git } from "../src/git.ts";
 import { extractPlan } from "../src/plan.ts";
 import { parseReviewReport, selectActionableFindings, isAcceptable, AmbiguousReportError } from "../src/report.ts";
 import { detectNoProgress, findingIdentity } from "../src/identity.ts";
@@ -116,6 +121,27 @@ test("confidentiality: matches token variants case-insensitively", () => {
   assert.ok(scanForDenyTerms("the AcmeCorp table", ["Acme Corp"]).length > 0);
   assert.ok(scanForDenyTerms("select from customer_orders", ["customer orders"]).length > 0);
   assert.equal(scanForDenyTerms("nothing sensitive", ["Acme Corp"]).length, 0);
+});
+
+test("git: dirty fingerprint reflects untracked file CONTENT, not just names", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qfb-git-"));
+  const g = (args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+  g(["init", "-q"]);
+  g(["config", "user.email", "t@t"]);
+  g(["config", "user.name", "t"]);
+  writeFileSync(join(dir, "seed.txt"), "seed\n");
+  g(["add", "-A"]);
+  g(["commit", "-q", "-m", "base"]);
+  const base = g(["rev-parse", "HEAD"]).trim();
+  const git = new Git(dir);
+
+  // New untracked file -> fingerprint changes.
+  writeFileSync(join(dir, "new.txt"), "v1\n");
+  const fp1 = git.snapshot(base).dirtyFingerprint;
+  // Same filename set, different CONTENT -> fingerprint must still change.
+  writeFileSync(join(dir, "new.txt"), "v2-different\n");
+  const fp2 = git.snapshot(base).dirtyFingerprint;
+  assert.notEqual(fp1, fp2);
 });
 
 test("stateMachine: rejects invalid transitions, allows orthogonal entry", () => {

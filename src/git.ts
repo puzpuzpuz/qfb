@@ -76,8 +76,26 @@ export class Git {
     } catch {
       diff = this.run(["diff"]);
     }
-    const untracked = this.untrackedFiles().sort().join("\n");
-    return createHash("sha256").update(diff + "\n--untracked--\n" + untracked).digest("hex").slice(0, 16);
+    // Hash untracked file CONTENT (not just names) so an edit to an untracked
+    // file flips the fingerprint \u2014 otherwise the "checkout changed during
+    // review" / stale-result guard could miss same-filename content changes.
+    const parts = [diff, "--untracked--"];
+    for (const f of this.untrackedFiles().sort()) {
+      try {
+        const abs = join(this.cwd, f);
+        const st = statSync(abs);
+        if (st.size > MAX_UNTRACKED_SCAN_BYTES) {
+          // Avoid reading very large artifacts; size+mtime still detects change.
+          parts.push(`${f}\u0000big:${st.size}:${st.mtimeMs}`);
+          continue;
+        }
+        const h = createHash("sha256").update(readFileSync(abs)).digest("hex");
+        parts.push(`${f}\u0000${h}`);
+      } catch {
+        parts.push(`${f}\u0000missing`);
+      }
+    }
+    return createHash("sha256").update(parts.join("\n")).digest("hex").slice(0, 16);
   }
 
   snapshot(base: string): GitSnapshot {
@@ -88,10 +106,6 @@ export class Git {
       submoduleHead: this.submoduleHead(),
       untrackedFiles: this.untrackedFiles(),
     };
-  }
-
-  stagedDiff(): string {
-    return this.run(["diff", "--cached"]);
   }
 
   /**

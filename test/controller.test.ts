@@ -301,6 +301,31 @@ test("confidentiality is gated on the git-derived diff, not the agent's self-rep
   assert.match(String(h.controller.status(runId).stopReason), /confidentiality/i);
 });
 
+test("a BLOCKED step can be unblocked by the operator and resumed to completion", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    (_r, git) => {
+      git.state.fingerprint = "s1-blocked";
+      return { artifact: artifact({ stepId: "S1", status: "BLOCKED", summary: "waiting on upstream dep" }) };
+    },
+  ]);
+  const { runId } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "b" });
+  h.controller.approve(runId);
+  const first = await h.controller.run(runId);
+  assert.equal(first, "blocked");
+  assert.equal(h.store.getSteps(runId)[0]!.status, "blocked");
+
+  // Operator addresses the blocker and resumes: the step must re-open and the
+  // rest of the happy path must complete (not skip the blocked step).
+  h.pi.push(implDone("S1")); h.pi.push(implDone("S2")); h.pi.push(implDone("S3"));
+  for (const x of HAPPY_HARDENING) h.pi.push(x);
+  h.pi.push(review(APPROVED));
+  h.controller.resume(runId);
+  assert.equal(h.store.getSteps(runId)[0]!.status, "pending");
+  const second = await h.controller.run(runId);
+  assert.equal(second, "COMPLETED");
+  assert.equal(h.controller.status(runId).stepsDone, 3);
+});
+
 test("review that is unacceptable with no actionable findings pauses for a human", async () => {
   // Verdict approved but the test gate failed: nothing for fix-pr to act on.
   const h = makeHarness(THREE_STEP_DESIGN, [
