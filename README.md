@@ -169,6 +169,15 @@ Run state lives **outside** the QuestDB source tree, under your XDG state dir
 artifacts. Override with `QFB_DB` and `QFB_ARTIFACTS`. QFB's own working materials (the design doc,
 handoff documents, reports) are **never** committed to or `.gitignore`d in the QuestDB checkout.
 
+**Parallel runs.** By default every run shares one `qfb.sqlite` (runs are rows keyed by `run_id`);
+only artifacts are split into per-run subdirs under `artifacts/<run-id>/`. Different features can run
+concurrently against this shared DB — SQLite WAL mode gives concurrent readers plus a serialized
+writer, a 5s `busy_timeout` absorbs simultaneous writes, and each process holds an exclusive
+per-`run_id` lock (a second process on the *same* run is refused). For full isolation, point each run
+at its own store via `QFB_DB` / `QFB_ARTIFACTS` (trade-off: `list`/`status` then only see that run,
+and resuming requires re-passing the same `QFB_DB`). Keep the shared DB on a local filesystem, not
+NFS.
+
 ## Testing
 
 ```bash

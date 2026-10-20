@@ -30,7 +30,10 @@ export class Store {
   constructor(dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    // WAL: concurrent readers + a serialized writer. busy_timeout: when parallel
+    // runs (distinct run_ids) in the same shared DB attempt a write at the same
+    // instant, wait up to 5s rather than failing fast with SQLITE_BUSY.
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.migrate();
   }
 
