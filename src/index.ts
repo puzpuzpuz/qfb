@@ -10,6 +10,8 @@ import { doctor } from "./doctor.ts";
 import { openPrIfNone } from "./pr.ts";
 import { State } from "./types.ts";
 import type { RunConfig } from "./types.ts";
+import { progressLines } from "./progress.ts";
+import type { StepView } from "./progress.ts";
 import { dbPath, artifactRoot, stateDir } from "./paths.ts";
 
 interface Args {
@@ -75,7 +77,7 @@ const HELP = `qfb — QuestDB Feature Builder
 One-shot (recommended):
   qfb build --repo PATH --design PATH [--base REF] [--pr-base BRANCH]
             [--deny a,b,c] [--commit] [--strict] [--level N]
-            [--yes] [--no-pr] [--pr-title "..."] [--skip-doctor]
+            [--yes] [--no-pr] [--pr-title "..."] [--skip-doctor] [--no-progress]
       Validate everything, prepare + approve the plan, orchestrate the whole
       feature to completion, then open a PR if none is open. Interruptible and
       resumable: re-run the same command to carry on from where it stopped.
@@ -270,11 +272,12 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
     return;
   }
 
-  // 4. Orchestrate to completion (resumes from persisted state).
-  out(`\nOrchestrating ${runId} \u2026 (interruptible; re-run 'qfb build ...' to continue)`);
-  const state = await ctl.run(runId);
+  // 4. Orchestrate to completion (resumes from persisted state), with a
+  //    self-refreshing compact progress view.
+  out(`\nOrchestrating ${runId} \u2026  (Ctrl-C to interrupt; re-run 'qfb build ...' to resume)\n`);
+  const state = await runWithProgress(ctl, runId, !flags["no-progress"]);
   const st = ctl.status(runId);
-  out(JSON.stringify(st, null, 2));
+  out("\n" + JSON.stringify(st, null, 2));
 
   if (state !== State.COMPLETED) {
     err(`\nRun ${runId} stopped in state '${state}': ${st.stopReason ?? ""}`);
@@ -333,6 +336,73 @@ function tailFile(path: string, n: number): string[] {
     return lines.slice(-n);
   } catch {
     return ["(transcript not available yet)"];
+  }
+}
+
+/** Drive ctl.run(runId) while repainting a compact progress block in place. */
+async function runWithProgress(ctl: Controller, runId: string, enabled: boolean): Promise<string> {
+  const interactive = enabled && Boolean(process.stdout.isTTY);
+  let frame = 0;
+  let drawn = 0;
+  let lastSig = "";
+
+  const paint = () => {
+    const status = ctl.status(runId);
+    const details = ctl.statusDetails(runId);
+    if (interactive) {
+      const lines = progressLines({
+        state: String(status.state),
+        sessionCount: Number(status.sessionCount),
+        steps: (status.steps as StepView[]) ?? [],
+        currentSession: details.currentSession
+          ? {
+              kind: details.currentSession.kind,
+              stepId: details.currentSession.stepId,
+              status: details.currentSession.status,
+              endedAt: details.currentSession.endedAt,
+            }
+          : null,
+        columns: process.stdout.columns ?? 80,
+        frame,
+      });
+      let buf = "";
+      if (drawn > 0) buf += `\x1b[${drawn}A`; // move to top of previous block
+      buf += "\x1b[0J"; // clear everything below
+      buf += lines.join("\n") + "\n";
+      process.stdout.write(buf);
+      drawn = lines.length;
+      frame++;
+    } else {
+      const sig = `${status.state}|${(status.steps as StepView[]).map((s) => s.status).join("")}|${status.sessionCount}`;
+      if (sig !== lastSig) {
+        lastSig = sig;
+        process.stdout.write(
+          `  [${status.state}] steps ${status.stepsDone}/${status.stepsTotal} \u00b7 sessions ${status.sessionCount}\n`,
+        );
+      }
+    }
+  };
+
+  const onSigint = () => {
+    if (interactive) process.stdout.write("\x1b[?25h"); // restore cursor
+    process.exit(130);
+  };
+  if (interactive) {
+    process.stdout.write("\x1b[?25l"); // hide cursor
+    process.on("SIGINT", onSigint);
+  }
+  const interval = setInterval(paint, interactive ? 400 : 2000);
+  interval.unref();
+  paint();
+  try {
+    return await ctl.run(runId);
+  } finally {
+    clearInterval(interval);
+    paint(); // final frame
+    if (interactive) {
+      process.stdout.write("\x1b[?25h");
+      process.removeListener("SIGINT", onSigint);
+    }
   }
 }
 

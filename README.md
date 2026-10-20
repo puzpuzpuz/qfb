@@ -80,6 +80,12 @@ What `qfb build` does, in order:
 5. **Orchestrates** serial implementation → hardening → review/fix → completion.
 6. **Opens a PR** for the branch if none is open (disable with `--no-pr`).
 
+While it runs, `build` shows a **self-refreshing compact progress view** — a
+phase bar (implementation ▸ hardening ▸ review/fix), per-step markers
+(`✓` done, spinner = active, `○` pending, `✗` failed), and the current agent
+session during the later phases. Disable it with `--no-progress`; on a non-TTY it
+prints a one-line update whenever progress changes.
+
 **Interruptible & resumable.** `build` finds-or-creates the run for a given
 `(repo, design, base)` and the controller recovers from persisted state, so if it
 is interrupted (Ctrl-C, crash, machine reboot) you simply **re-run the exact same
