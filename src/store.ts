@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { hostname } from "node:os";
-import type { PlanStep, RunConfig, StateName, GitSnapshot } from "./types.ts";
+import type { Decision, PlanStep, RunConfig, StateName, GitSnapshot } from "./types.ts";
 
 export interface SessionRow {
   rowId: number;
@@ -133,6 +133,16 @@ export class Store {
         key TEXT NOT NULL,
         value TEXT NOT NULL,
         PRIMARY KEY (run_id, key)
+      );
+      CREATE TABLE IF NOT EXISTS decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        design_revised INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS locks (
         run_id TEXT PRIMARY KEY,
@@ -295,6 +305,33 @@ export class Store {
 
   setDesignHash(id: string, hash: string): void {
     this.db.prepare("UPDATE runs SET design_hash = ? WHERE id = ?").run(hash, id);
+  }
+
+  setDesignPath(id: string, path: string): void {
+    this.db.prepare("UPDATE runs SET design_path = ? WHERE id = ?").run(path, id);
+  }
+
+  // ---- Operator decisions ----
+  addDecision(runId: string, d: Omit<Decision, "id" | "createdAt">): number {
+    const info = this.db
+      .prepare(
+        "INSERT INTO decisions (run_id, stage, step_id, question, answer, design_revised, created_at) VALUES (?,?,?,?,?,?,?)",
+      )
+      .run(runId, d.stage, d.stepId, d.question, d.answer, d.designRevised ? 1 : 0, this.now());
+    return Number(info.lastInsertRowid);
+  }
+
+  getDecisions(runId: string): Decision[] {
+    const rows = this.db.prepare("SELECT * FROM decisions WHERE run_id = ? ORDER BY id").all(runId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: r.id as number,
+      stage: r.stage as string,
+      stepId: r.step_id as string,
+      question: r.question as string,
+      answer: r.answer as string,
+      designRevised: (r.design_revised as number) === 1,
+      createdAt: r.created_at as string,
+    }));
   }
 
   // ---- Steps ----
@@ -547,7 +584,7 @@ export class Store {
 }
 
 /** Every table keyed by `run_id` (`runs` itself is keyed by `id`). Locks hold the run's lock row. */
-const RUN_TABLES = ["steps", "transitions", "sessions", "checkpoints", "reviews", "counters", "locks"] as const;
+const RUN_TABLES = ["steps", "transitions", "sessions", "checkpoints", "reviews", "counters", "decisions", "locks"] as const;
 
 function toSessionRow(r: Record<string, unknown>): SessionRow {
   return {

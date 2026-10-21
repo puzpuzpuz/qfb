@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/store.ts";
@@ -28,6 +28,8 @@ export class FakeGit implements GitLike {
     refs: {} as Record<string, string>,
   };
   commits: string[] = [];
+  /** Paths the controller asked to keep out of the feature (as real Git's `exclude`). */
+  exclude: string[] = [];
   branch() {
     return this.state.branch;
   }
@@ -55,13 +57,13 @@ export class FakeGit implements GitLike {
   }
   changedFiles(base: string) {
     this.checkRef(base);
-    return this.state.changedFiles;
+    return this.state.changedFiles.filter((f) => !this.exclude.includes(f));
   }
   addedContent(base: string): AddedContent {
     this.checkRef(base);
     return {
       files: [
-        ...this.state.changedFiles.map((path) => ({ path, added: "" })),
+        ...this.changedFiles(base).map((path) => ({ path, added: "" })),
         ...(this.state.diffText ? [{ path: "(diff)", added: this.state.diffText }] : []),
       ],
       unscannable: this.state.unscannable,
@@ -153,6 +155,17 @@ export class MockPi implements PiAdapter {
   }
 }
 
+/**
+ * A design-revision agent: writes `revise(design)` as its draft next to its
+ * artifact (where QFB's prompt asks for it) and reports DONE.
+ */
+export function draftDesign(designPath: string, revise: (design: string) => string, summary = "revised the design"): PiHandler {
+  return (req) => {
+    writeFileSync(`${req.artifactPath}.design.md`, revise(readFileSync(designPath, "utf8")));
+    return { artifact: artifact({ kind: "design", status: "DONE", summary, changedFiles: [], testCommands: [] }) };
+  };
+}
+
 /** Identity placeholder MockPi replaces with the launching session's run/step id. */
 export const AUTO = "<auto>";
 
@@ -198,7 +211,10 @@ export function makeHarness(design: string, handlers: PiHandler[] = []): Harness
       store: s,
       pi,
       herdr: new NullHerdrAdapter(),
-      makeGit: () => git,
+      makeGit: (_repo, o) => {
+        git.exclude = o.exclude;
+        return git;
+      },
       artifactRoot: join(dir, "artifacts"),
       runTest: tests.run,
       orphanGraceMs: 0,

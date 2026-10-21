@@ -961,12 +961,13 @@ test("clean deletes the run's rows in every table and its artifacts (incl. Pi se
   const runId = start(h, { checkpointPolicy: "commit" });
   const { runId: other } = h.controller.init({ repoPath: "/repo", designPath: h.designPath, base: "other-base" });
   assert.equal(await h.controller.run(runId), "COMPLETED");
+  h.store.addDecision(runId, { stage: "IMPLEMENTING", stepId: "S1", question: "q", answer: "a", designRevised: false });
 
   const dir = join(h.dir, "artifacts", runId);
   // Pi was told to keep its own session files inside the run's artifact dir.
   assert.ok(h.pi.launches.length > 0 && h.pi.launches.every((l) => l.sessionDir === join(dir, "pi-sessions")));
   const before = leftoverRows(h, runId);
-  for (const t of ["runs", "steps", "transitions", "sessions", "checkpoints", "reviews", "counters"]) {
+  for (const t of ["runs", "steps", "transitions", "sessions", "checkpoints", "reviews", "counters", "decisions"]) {
     assert.ok(before[t]! > 0, `expected ${t} rows before clean`);
   }
   const otherBefore = leftoverRows(h, other);

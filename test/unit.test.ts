@@ -463,3 +463,49 @@ test("validateConfig: NaN, out-of-range, and unknown settings are rejected", () 
   assert.throws(() => validateConfig({ ...DEFAULT_CONFIG, maxTotalSessions: 2.5 }), /maxTotalSessions/);
   assert.throws(() => validateConfig({ ...DEFAULT_CONFIG, maxReviewIteration: 3 }), /unknown setting "maxReviewIteration"/);
 });
+
+test("gating: orchestration notes are matched by name and document type, not by a mention anywhere in a path", () => {
+  for (const f of ["handoff.md", "HANDOFF-lv-more-window-functions.md", "docs/DECISION-S4-range.md", "coverage-gaps.txt", ".qfb/x", "core/.gitignore"]) {
+    const r = gate({ changedFiles: [f] });
+    assert.deepEqual(r.problems.map((p) => [p.code, p.human, p.files]), [["orchestration-doc", true, [f]]], f);
+  }
+  for (const f of ["core/src/main/java/io/questdb/cutlass/HandoffQueue.java", "core/src/test/java/DecisionTreeTest.java"]) {
+    assert.equal(gate({ changedFiles: [f] }).passed, true, f);
+  }
+});
+
+test("gating: every problem carries a code, who must act, and what to check it against", () => {
+  const r = gate({
+    artifact: art({ testCommands: [] }),
+    verifiedTests: [],
+    after: snap({ head: "h2", branch: "other" }),
+    denyList: ["AcmeCorp"],
+    added: addedIn("src/Foo.java", "AcmeCorp"),
+  });
+  assert.deepEqual(
+    r.problems.map((p) => [p.code, p.human, p.expected ?? null, p.actual ?? null]),
+    [
+      ["branch-changed", true, "feature/x", "other"],
+      ["head-moved", true, "h1", "h2"],
+      ["no-tests", false, null, null],
+      ["deny-term", true, null, null],
+    ],
+  );
+  assert.equal(r.problems[3]!.term, "AcmeCorp");
+  assert.deepEqual(r.failures, r.problems.map((p) => p.message));
+  // Only agent-fixable problems: a retry, not a pause.
+  assert.equal(gate({ artifact: art({ testCommands: [] }), verifiedTests: [] }).pause, false);
+});
+
+test("checkArtifact: an agent's decision request is normalized; a malformed one is dropped", () => {
+  const withDecision = (decision: unknown) => validateArtifact({ ...art({ status: "NEEDS_DECISION" }), decision })!.decision;
+  assert.deepEqual(withDecision({ question: " Constant or reject? ", options: ["Constant", 3, "Reject"], recommended: 1, context: 7 }), {
+    question: "Constant or reject?",
+    options: ["Constant", "Reject"],
+    recommended: 1,
+    context: "",
+  });
+  assert.equal(withDecision({ options: ["A"] }), undefined);
+  assert.equal(withDecision("just text"), undefined);
+  assert.equal(withDecision({ question: "Q", options: ["A"], recommended: 4 })!.recommended, null);
+});

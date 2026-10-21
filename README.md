@@ -96,9 +96,9 @@ prints a one-line update whenever progress changes.
 is interrupted (Ctrl-C, crash, machine reboot) you simply **re-run the exact same
 command** and it carries on from where it stopped — never duplicating verified
 work, and never starting a second writer next to a session that is still alive
-(that case enters `reconciliation`). When it pauses for a human decision, stops
-on a budget, or needs reconciliation, it tells you why: address it, run
-`qfb resume RUN_ID`, and re-run `build`.
+(that case enters `reconciliation`). When it stops for you (an agent's question, a
+rejected change, an edited design, a budget), it says why and what to do, and
+`qfb continue` picks the run up again (see below).
 
 ### Useful `build` flags
 
@@ -117,6 +117,35 @@ on a budget, or needs reconciliation, it tells you why: address it, run
 > Use `--no-pr`, or the granular `qfb run` (which never pushes), to keep the
 > conservative behavior.
 
+### When a run stops: `qfb continue`
+
+Every stop records *why* in a structured form, and `qfb status` / `qfb continue` explain it with
+concrete fixes (exact files, commands, and refs). `qfb continue` (from inside the checkout, the run
+ID is optional) then resolves the stop in place and carries on to completion, PR included:
+
+- **An agent hits a design question or flaw.** Agents are told not to guess: they stop with a
+  question, options, and a recommendation. Pick an option or type an answer. Your answer is
+  recorded and given to *every* later session (implementation, hardening, fix-pr, and review, which
+  will not flag a settled decision). If the answer changes the spec, say so: **an agent drafts the
+  matching design change**, you see the design diff and the resulting plan diff, and only the draft
+  you approve replaces the design. Steps you already finished keep their status; changed steps run
+  next.
+- **You edit the design yourself** (at any time): `continue` shows the change against the approved
+  version and the plan diff, and approves exactly that in one step.
+- **A change was rejected by a gate.** Each problem is listed with its fix (delete a note an agent
+  left, undo an agent's commit with `git reset --soft <sha>`, remove a deny-listed term, ...);
+  `continue` re-checks that it is fixed before resuming. Problems a fresh attempt can fix (e.g.
+  "no validation commands ran") are retried automatically.
+- **A budget ran out:** retry as is, or with guidance for the agent.
+
+Without a terminal, nothing is asked: `continue` resumes when no input is needed, takes answers from
+`--option N` / `--answer "..."` (`--accept-unscannable`, `--keep-local`, `--design` likewise), and
+stops at the next point that needs you.
+
+**Design docs in the checkout are fine.** Keep `HANDOFF-feature.md` next to the code if you like:
+QFB keeps the run's design out of every gate, fingerprint, and commit. `--keep-local PATH` does the
+same for your other notes (documents only; code is never hidden from the gates).
+
 ### Granular / recovery commands
 
 The step-by-step commands remain available for inspection, manual control, and
@@ -127,6 +156,7 @@ qfb init --repo /path/to/questdb --design ./feature-design.md --base origin/mast
 qfb plan RUN_ID            # review the normalized manifest
 qfb approve RUN_ID
 qfb run RUN_ID             # drive to the next stopping point (resumes on re-run)
+qfb continue [RUN_ID]      # resolve whatever stopped the run, then carry on to completion
 qfb status / pause / resume / stop / logs RUN_ID
 ```
 
@@ -168,12 +198,13 @@ An agent's `DONE` is a **claim, not a result** — it is only an input to the ga
 | Command | Purpose |
 |---------|---------|
 | `qfb build --repo PATH --design PATH [--base REF] [--pr-base BRANCH] [--yes] [--no-pr] [--pr-title …] [--skip-doctor] [--deny …] [--commit] [--strict] [--level N]` | **One-shot, resumable orchestration**: validate → prepare → approve → run → open PR. Re-run to resume. |
+| `qfb continue [RUN_ID] [--answer "..."] [--option N] [--accept-unscannable] [--keep-local PATH,...] [--design PATH] [--yes]` | Pick a run up wherever it stopped: explain why, resolve it (answer an agent's question, optionally with an agent-drafted design revision you approve; approve an edited design; re-check a gate fix; vet files; retry), then run to completion and open the PR `build` asked for. RUN_ID defaults to the unfinished run of the current checkout. |
 | `qfb doctor [--repo PATH]` | Check Pi, Herdr, skills, subagents, credentials, execution-mode compatibility. |
 | `qfb init --repo PATH --design PATH --base REF [--deny a,b] [--commit] [--strict] [--level N]` | Create a run; resolve `--base` to a commit SHA (the review range never drifts after a fetch); extract the plan manifest. |
 | `qfb plan RUN_ID` | Print the normalized plan manifest produced by the preparation phase. |
 | `qfb approve RUN_ID` | Approve the design + plan (freezes the design hash). If the design changed since the plan was extracted, it re-extracts, shows the step diff, and needs a second `approve`. Only for runs awaiting (re-)approval; it is not a resume. |
 | `qfb run RUN_ID` | Execute the workflow to its next natural stopping point. |
-| `qfb status RUN_ID` | Phase, step progress, session, Git state, blockers, review iteration. |
+| `qfb status RUN_ID [--verbose] [--json]` | Phase, step progress, decisions, and, for a stopped run, why it stopped and what to do. `--json` for the raw status. |
 | `qfb pause / resume / stop RUN_ID` | Safe pause (a live controller pauses after its current session), reconcile-and-continue back to the interrupted phase (a `failed` run gets an audited retry), forced stop (kills the session's process tree, preserves evidence, enters `reconciliation`). |
 | `qfb resume RUN_ID --accept-unscannable` | Record that you vetted the files the confidentiality scan could not read (binary, too large, unreadable); the vetting covers exactly that content. |
 | `qfb logs RUN_ID` | Locate transcripts, test logs, review/fix reports. |
@@ -189,8 +220,11 @@ including inside identifiers: `trade_events` also catches `testTradeEventsOoo`).
 
 Run state lives **outside** the QuestDB source tree, under your XDG state dir
 (`$XDG_STATE_HOME/qfb` or `~/.local/state/qfb`): a SQLite database plus versioned filesystem
-artifacts. Override with `QFB_DB` and `QFB_ARTIFACTS`. QFB's own working materials (the design doc,
-handoff documents, reports) are **never** committed to or `.gitignore`d in the QuestDB checkout.
+artifacts. Override with `QFB_DB` and `QFB_ARTIFACTS`. QFB's own working materials (manifests,
+handoffs, reports, agents' notes in `artifacts/<run-id>/scratch/`) live there, never in the QuestDB
+checkout. Your design doc may live in the checkout: QFB keeps it (and docs kept with `--keep-local`)
+out of every gate, fingerprint and commit, and never edits `.gitignore` to do so. The operator's
+decisions are stored per run and handed to every later session.
 Pi's own session files for a run (including nested review/fix subagents) are kept in
 `artifacts/<run-id>/pi-sessions/`, not in Pi's default session store.
 
@@ -223,8 +257,11 @@ hardening and fix-pr stages, the review/fix loop, needs-discussion pauses, non-C
 stale-result rejection, iteration limits, finding/bug no-progress detection, the hard session
 ceiling, run and checkout lock exclusivity, pause/stop from another process, resume back to the
 interrupted phase, and crash recovery (a still-running session is never joined by a second writer;
-an outcome is re-processed but never replayed). `test/procs.test.ts` exercises the real
-process-group handling and push guard against real processes and a real git repo.
+an outcome is re-processed but never replayed). `test/continue.test.ts` drives the operator flows
+of `qfb continue` with scripted answers: decisions reaching every later session, agent-drafted
+design revisions applied only as reviewed, edited designs, gate re-checks, local docs, a missing
+design, and retries with guidance. `test/procs.test.ts` exercises the real process-group handling,
+the push guard, and design docs kept out of commits against real processes and a real git repo.
 
 A **real opt-in integration smoke test** against installed Pi/Herdr/QuestDB skills is the subject of
 Milestone 0 — see [`docs/FEASIBILITY.md`](docs/FEASIBILITY.md). Unit tests alone never establish

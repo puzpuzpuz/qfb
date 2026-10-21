@@ -1,25 +1,34 @@
 #!/usr/bin/env -S node --experimental-strip-types --no-warnings
 import { createInterface } from "node:readline/promises";
-import { readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { readFileSync, realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { Store } from "./store.ts";
-import { Controller, DESIGN_CHANGED, PlanChangedError } from "./controller.ts";
-import type { PlanInfo } from "./controller.ts";
+import { Controller, PlanChangedError } from "./controller.ts";
 import { Git } from "./git.ts";
 import { RpcPiAdapter } from "./adapters/pi.ts";
 import { CliHerdrAdapter, NullHerdrAdapter } from "./adapters/herdr.ts";
 import { doctor } from "./doctor.ts";
 import { openPrIfNone } from "./pr.ts";
 import { State } from "./types.ts";
-import { isOrthogonal } from "./stateMachine.ts";
-import type { RunConfig } from "./types.ts";
+import type { RunConfig, StateName } from "./types.ts";
 import { progressLines } from "./progress.ts";
 import type { StepView } from "./progress.ts";
 import { dbPath, artifactRoot, stateDir } from "./paths.ts";
+import { drive } from "./drive.ts";
+import type { ContinueOptions, IO } from "./drive.ts";
+import { explain, q, renderStatus } from "./explain.ts";
+import type { StatusView } from "./explain.ts";
 
 interface Args {
   _: string[];
   flags: Record<string, string | boolean>;
 }
+
+/** Flags that never take a value, so `--yes RUN_ID` keeps RUN_ID as an argument. */
+const BOOLEAN_FLAGS = new Set([
+  "yes", "commit", "strict", "no-pr", "skip-doctor", "no-progress", "verbose", "v", "json", "accept-unscannable", "help",
+]);
 
 function parseArgs(argv: string[]): Args {
   const _: string[] = [];
@@ -36,7 +45,7 @@ function parseArgs(argv: string[]): Args {
       }
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("--")) {
+      if (!BOOLEAN_FLAGS.has(key) && next !== undefined && !next.startsWith("--")) {
         flags[key] = next;
         i++;
       } else {
@@ -97,25 +106,43 @@ function printPlanChange(diff: string[], out: (s: string) => void): void {
   for (const d of diff) out(`  ${d}`);
 }
 
-async function confirm(question: string): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const ans = await rl.question(question);
-    return /^y(es)?$/i.test(ans.trim());
-  } finally {
-    rl.close();
-  }
+/** The terminal as drive.ts sees it. */
+function processIO(): IO {
+  return {
+    out: (l) => process.stdout.write(l + "\n"),
+    err: (l) => process.stderr.write(l + "\n"),
+    interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    ask: async (prompt) => {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        return await rl.question(prompt);
+      } finally {
+        rl.close();
+      }
+    },
+    edit: async (path) => {
+      const editor = process.env.VISUAL || process.env.EDITOR || "vi";
+      spawnSync(`${editor} ${q(path)}`, { shell: true, stdio: "inherit" });
+    },
+  };
 }
 
-const HELP = `qfb — QuestDB Feature Builder
+const HELP = `qfb \u2014 QuestDB Feature Builder
 
 One-shot (recommended):
   qfb build --repo PATH --design PATH [--base REF] [--pr-base BRANCH]
             [--deny a,b,c] [--commit] [--strict] [--level N]
             [--yes] [--no-pr] [--pr-title "..."] [--skip-doctor] [--no-progress]
       Validate everything, prepare + approve the plan, orchestrate the whole
-      feature to completion, then open a PR if none is open. Interruptible and
-      resumable: re-run the same command to carry on from where it stopped.
+      feature to completion, then open a PR if none is open.
+
+  qfb continue [RUN_ID] [--answer "..."] [--option N] [--accept-unscannable]
+               [--keep-local PATH,...] [--design PATH] [--yes] [--no-progress]
+      Pick a run up wherever it stopped: explains why, helps you resolve it
+      (answer an agent's question, optionally letting an agent draft the
+      matching design change for your approval; approve an edited design;
+      check a fix), then carries on to completion. RUN_ID defaults to the
+      unfinished run of the checkout you are in.
 
 Granular / recovery commands:
   qfb doctor [--repo PATH]
@@ -123,7 +150,7 @@ Granular / recovery commands:
   qfb approve RUN_ID
   qfb plan RUN_ID
   qfb run RUN_ID
-  qfb status RUN_ID [--verbose]
+  qfb status RUN_ID [--verbose] [--json]
   qfb pause RUN_ID
   qfb resume RUN_ID [--accept-unscannable]
   qfb stop RUN_ID
@@ -132,6 +159,9 @@ Granular / recovery commands:
   qfb clean RUN_ID [--yes]
       Permanently delete the run's state-store records and its artifacts
       (transcripts, Pi sessions, logs, reports). Never touches the checkout.
+
+The design document may live in the checkout: QFB keeps it out of its gates
+and commits (as it does with --keep-local docs).
 
 State store: ${stateDir()}
 `;
@@ -158,6 +188,21 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === "continue") {
+    exitOnSignals();
+    const { store, controller } = makeStack();
+    const runId = _[1] ?? inferRunId(store);
+    process.exitCode = await drive({
+      ctl: controller,
+      runId,
+      io: processIO(),
+      opts: continueOptions(flags),
+      run: (id) => runWithProgress(controller, id, !flags["no-progress"]),
+      finish: (id) => finishRun(controller, id),
+    });
+    return;
+  }
+
   const ctl = makeController();
 
   switch (cmd) {
@@ -177,7 +222,7 @@ async function main(): Promise<void> {
             `approve it as is, or edit the design first ('qfb approve' re-extracts it).\n`,
         );
       }
-      process.stdout.write(`Next: review the manifest (qfb plan ${res.runId}), then qfb approve ${res.runId}\n`);
+      process.stdout.write(`Next: review the manifest (qfb plan ${res.runId}), then qfb continue ${res.runId} (approves, then runs)\n`);
       break;
     }
     case "approve": {
@@ -190,7 +235,7 @@ async function main(): Promise<void> {
         throw e;
       }
       if (ctl.status(id).planAmbiguous) process.stdout.write(`! Approved an ambiguous plan mapping as proposed.\n`);
-      process.stdout.write(`Approved ${id}. Next: qfb run ${id}\n`);
+      process.stdout.write(`Approved ${id}. Next: qfb continue ${id}\n`);
       break;
     }
     case "plan": {
@@ -204,13 +249,14 @@ async function main(): Promise<void> {
     case "run": {
       exitOnSignals();
       const state = await ctl.run(requireId(_));
-      process.stdout.write(`Run ${_[1]} settled in state: ${state}\n`);
-      process.stdout.write(JSON.stringify(ctl.status(_[1]!), null, 2) + "\n");
+      process.stdout.write(`Run ${_[1]} settled in state: ${state}\n\n`);
+      printStatus(ctl, _[1]!);
       break;
     }
     case "status": {
       const id = requireId(_);
-      process.stdout.write(JSON.stringify(ctl.status(id), null, 2) + "\n");
+      if (flags.json) process.stdout.write(JSON.stringify(ctl.status(id), null, 2) + "\n");
+      else printStatus(ctl, id);
       if (flags.verbose || flags.v) printStatusDetails(ctl, id);
       break;
     }
@@ -219,20 +265,20 @@ async function main(): Promise<void> {
       process.stdout.write(
         r === "paused"
           ? `Paused ${_[1]}.\n`
-          : `Pause requested for ${_[1]}; its live controller pauses once the current session finishes.\n`,
+          : `Pause requested for ${_[1]}; its live controller pauses once the current session finishes. Later: qfb continue ${_[1]}\n`,
       );
       break;
     }
     case "resume": {
       const to = await ctl.resume(requireId(_), { acceptUnscannable: Boolean(flags["accept-unscannable"]) });
-      process.stdout.write(`Resumed ${_[1]} -> ${to}. Next: qfb run ${_[1]} (or re-run 'qfb build ...')\n`);
+      process.stdout.write(`Resumed ${_[1]} -> ${to}. Next: qfb continue ${_[1]}\n`);
       break;
     }
     case "stop": {
       const r = await ctl.stop(requireId(_));
       process.stdout.write(
         r === "stopped"
-          ? `Stopped ${_[1]}; it is in reconciliation (evidence preserved). Inspect the checkout, then qfb resume ${_[1]}.\n`
+          ? `Stopped ${_[1]}; it is in reconciliation (evidence preserved). Inspect the checkout, then qfb continue ${_[1]}.\n`
           : `Stop requested for ${_[1]}; any active session was terminated and the live controller enters reconciliation.\n`,
       );
       break;
@@ -256,18 +302,20 @@ async function main(): Promise<void> {
 
 /**
  * One-shot orchestration. Validates the environment, finds-or-creates the run
- * for this (repo, design, base), approves it, drives the controller to
- * completion, and opens a PR if none is open. Idempotent and resumable:
- * re-running carries on from the persisted state (the controller itself owns
- * crash recovery).
+ * for this (repo, design, base), then hands it to `continue` (drive.ts), which
+ * approves, drives the controller to completion, and opens a PR if none is
+ * open. Idempotent and resumable: re-running carries on from the persisted
+ * state, resolving whatever stopped it.
  */
 async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> {
   const out = (s: string) => process.stdout.write(s + "\n");
   const err = (s: string) => process.stderr.write(s + "\n");
 
-  const repo = str(flags.repo);
-  const design = str(flags.design);
-  if (!repo || !design) throw new Error("build requires --repo and --design");
+  const repoArg = str(flags.repo);
+  const designArg = str(flags.design);
+  if (!repoArg || !designArg) throw new Error("build requires --repo and --design");
+  const repo = resolve(repoArg);
+  const design = resolve(designArg);
 
   const git = new Git(repo);
   const prBase = str(flags["pr-base"]) ?? git.defaultBase();
@@ -294,8 +342,9 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
 
   const { store, controller: ctl } = makeStack();
 
-  // 2. Find-or-create the run (resumption).
-  let run = store.findRun(repo, design, base);
+  // 2. Find-or-create the run (resumption). Runs created before paths were
+  //    resolved are found by the paths as given.
+  const run = store.findRun(repo, design, base) ?? store.findRun(repoArg, designArg, base);
   let runId: string;
   if (!run) {
     // A PR needs commits: unless --no-pr, checkpoints are commits of the
@@ -305,7 +354,8 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
     runId = res.runId;
     out(`Prepared ${runId}: ${res.steps} step(s) [strategy: ${res.strategy}].`);
     out(`Manifest: ${res.preparedPlanPath}`);
-    if (res.ambiguous) {
+    if (ctl.localDocs(runId).length > 0) out(`The design is inside the checkout; QFB keeps it out of its gates and commits.`);
+    if (res.ambiguous && !process.stdin.isTTY) {
       err("Plan is ambiguous; edit the design doc and re-run. Nothing started.");
       process.exitCode = 1;
       return;
@@ -314,86 +364,92 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
     runId = run.id;
     out(`Resuming ${runId} (state: ${run.state}).`);
   }
-
-  // 3. Approval gate (idempotent).
-  run = store.getRun(runId)!;
-  const reapproval = run.state === State.PAUSED && run.stopReason === DESIGN_CHANGED;
-  if (run.state === State.AWAITING_APPROVAL || reapproval) {
-    // Approve exactly what the design on disk says now (re-extracted if it changed).
-    const plan: PlanInfo = ctl.refreshPlan(runId);
-    if (plan.diff.length > 0) printPlanChange(plan.diff, out);
-    for (const n of plan.notes.filter((n) => n.startsWith("AMBIGUOUS"))) out(`  ${n}`);
-    if (plan.steps === 0) {
-      err(`No plan steps could be extracted from ${design}; give it an ordered Implementation Plan, then re-run. Nothing started.`);
-      process.exitCode = 1;
-      return;
-    }
-    // --yes is blanket consent to a clear, first-time plan. It never covers a
-    // changed design or an ambiguous mapping: those need a human to look.
-    const why = reapproval ? "the approved design changed" : plan.ambiguous ? "the plan structure is ambiguous" : null;
-    if (why || !flags.yes) {
-      if (!process.stdin.isTTY) {
-        err(
-          why
-            ? `Explicit approval required because ${why}; --yes does not cover this. Review 'qfb plan ${runId}', ` +
-                `then 'qfb approve ${runId}' and re-run 'qfb build ...' (or edit the design and re-run).`
-            : `Approval required. Review 'qfb plan ${runId}', then re-run with --yes (or 'qfb approve ${runId}').`,
-        );
-        process.exitCode = 1;
-        return;
-      }
-      out(`\nReview the normalized plan with: qfb plan ${runId}${why ? `  (attention: ${why})` : ""}`);
-      const ok = await confirm(`Approve this plan and start the autonomous build of ${runId}? [y/N] `);
-      if (!ok) {
-        out(`Not approved; nothing started. Re-run 'qfb build ...' to resume.`);
-        return;
-      }
-    }
-    ctl.approve(runId);
-    out(`Approved ${runId}.`);
-  } else if (isOrthogonal(run.state)) {
-    // Paused, blocked, failed, or in reconciliation: never silently resume.
-    err(`Run ${runId} is ${run.state}: ${run.stopReason ?? "(no reason recorded)"}`);
-    err(`Inspect/fix the checkout, then 'qfb resume ${runId}' and re-run 'qfb build ...'.`);
-    process.exitCode = 2;
-    return;
-  }
-  if (!flags["no-pr"] && run.config.checkpointPolicy !== "commit") {
+  ctl.setBuildOptions(runId, { pr: !flags["no-pr"], prBase, prTitle: str(flags["pr-title"]) ?? null });
+  if (!flags["no-pr"] && store.getRun(runId)!.config.checkpointPolicy !== "commit") {
     out(`! ${runId} uses snapshot checkpoints: it can complete, but QFB will not push uncommitted work (use --no-pr, or start a new run).`);
   }
 
-  // 4. Orchestrate to completion (resumes from persisted state), with a
-  //    self-refreshing compact progress view.
-  out(`\nOrchestrating ${runId} \u2026  (Ctrl-C to interrupt; re-run 'qfb build ...' to resume)\n`);
-  const state = await runWithProgress(ctl, runId, !flags["no-progress"]);
-  const st = ctl.status(runId);
-  out("\n" + JSON.stringify(st, null, 2));
+  // 3-5. Approve, orchestrate, resolve stops, and open the PR.
+  out(`\nOrchestrating ${runId} \u2026  (Ctrl-C to interrupt; 'qfb continue ${runId}' picks it up again)\n`);
+  process.exitCode = await drive({
+    ctl,
+    runId,
+    io: processIO(),
+    opts: { yes: Boolean(flags.yes) },
+    run: (id) => runWithProgress(ctl, id, !flags["no-progress"]),
+    finish: (id) => finishRun(ctl, id),
+  });
+}
 
-  if (state !== State.COMPLETED) {
-    err(`\nRun ${runId} stopped in state '${state}': ${st.stopReason ?? ""}`);
-    err(
-      st.stopReason === DESIGN_CHANGED
-        ? `Review the edited design, then re-run 'qfb build ...' to approve the updated plan.`
-        : `It is resumable \u2014 address the issue, then 'qfb resume ${runId}' and re-run 'qfb build ...'.`,
-    );
-    process.exitCode = 2;
-    return;
+/** One-shot answers and fixes `qfb continue` accepts. */
+function continueOptions(flags: Record<string, string | boolean>): ContinueOptions {
+  const o: ContinueOptions = { yes: Boolean(flags.yes), acceptUnscannable: Boolean(flags["accept-unscannable"]) };
+  if (flags.option !== undefined) {
+    if (typeof flags.option !== "string" || !/^\d+$/.test(flags.option)) throw new Error("--option takes the number of an option");
+    o.option = Number(flags.option);
   }
+  for (const k of ["answer", "keep-local", "design"] as const) {
+    if (flags[k] === true) throw new Error(`--${k} requires a value`);
+  }
+  if (typeof flags.answer === "string") o.answer = flags.answer;
+  if (typeof flags["keep-local"] === "string") o.keepLocal = flags["keep-local"].split(",").map((x) => x.trim()).filter(Boolean);
+  if (typeof flags.design === "string") o.design = flags.design;
+  return o;
+}
 
-  // 5. Open a PR if none is open (final step only).
-  if (!flags["no-pr"]) {
-    const title =
-      str(flags["pr-title"]) ?? `feat: ${design.split("/").pop()?.replace(/\.md$/, "") ?? "feature"}`;
+/**
+ * The run `qfb continue` means without a RUN_ID: the unfinished run of the
+ * checkout you are in, else the only unfinished run there is.
+ */
+function inferRunId(store: Store): string {
+  const unfinished = store.listRuns().filter((r) => r.state !== State.COMPLETED);
+  const real = (p: string) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  let top: string | null = null;
+  try {
+    top = real(execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim());
+  } catch {
+    // Not in a checkout.
+  }
+  const here = top ? unfinished.filter((r) => real(r.repoPath) === top) : [];
+  const pick = here.length > 0 ? here : unfinished;
+  if (pick.length === 1) {
+    if (here.length === 0) process.stdout.write(`Continuing ${pick[0]!.id} (${pick[0]!.repoPath}).\n`);
+    return pick[0]!.id;
+  }
+  if (pick.length === 0) throw new Error("There is no unfinished QFB run; start one with 'qfb build' (see 'qfb list').");
+  throw new Error(
+    `Several unfinished runs${here.length ? " use this checkout" : ""}; name one: ` +
+      pick.map((r) => `${r.id} (${r.state}, ${r.repoPath})`).join("; "),
+  );
+}
+
+/** The run is COMPLETED: report it and, if `build` asked for one, open the PR. Returns the exit code. */
+async function finishRun(ctl: Controller, runId: string): Promise<number> {
+  const out = (s: string) => process.stdout.write(s + "\n");
+  out("");
+  printStatus(ctl, runId);
+  const st = ctl.status(runId);
+  const opts = ctl.buildOptions(runId);
+  if (opts?.pr) {
+    const run = ctl.status(runId) as { branch: string; baseRef: string; designPath: string };
+    const title = opts.prTitle ?? `feat: ${run.designPath.split("/").pop()?.replace(/\.md$/, "") ?? "feature"}`;
     const body =
       `Automated QFB run ${runId}.\n\n` +
       `- Steps completed: ${st.stepsDone}/${st.stepsTotal}\n` +
       `- Review iterations: ${st.reviews}\n` +
       `- Checkpoints: ${st.checkpoints}\n\n` +
       `See QFB artifacts at ${artifactRoot()}/${runId} for the full evidence trail.`;
+    const store = new Store(dbPath());
     const final = store.getRun(runId)!;
-    const pr = openPrIfNone(repo, git, {
+    const pr = openPrIfNone(final.repoPath, ctl.gitForRun(runId), {
       branch: final.branch,
-      prBase,
+      prBase: opts.prBase,
       featureBase: final.baseRef,
       title,
       body,
@@ -403,10 +459,25 @@ async function cmdBuild(flags: Record<string, string | boolean>): Promise<void> 
     });
     out(pr.opened ? `\n\u2713 Opened PR: ${pr.url}` : `\nPR: ${pr.reason}${pr.url ? ` (${pr.url})` : ""}`);
     // Success means a PR now carries the accepted commit (a new one, or an open one we pushed to).
-    if (!pr.opened && !(pr.pushed && pr.url)) process.exitCode = 3;
+    if (!pr.opened && !(pr.pushed && pr.url)) return 3;
   }
-
+  const local = ctl.localDocs(runId);
+  if (local.length > 0) {
+    out(`\nNot part of the feature (kept out of QFB's commits; don't commit them yourself): ${local.join(", ")}`);
+  }
   out(`\n\u2713 Feature complete: ${runId}`);
+  return 0;
+}
+
+/** Human-readable status, with why the run stopped and what to do about it. */
+function printStatus(ctl: Controller, runId: string): void {
+  const st = ctl.status(runId) as unknown as StatusView & { stopReason: string | null };
+  const blocker = ctl.blocker(runId);
+  const stopped = blocker !== null || [State.PAUSED, State.BLOCKED, State.FAILED, State.RECONCILIATION].includes(st.state as never);
+  const why = stopped
+    ? explain({ runId, state: st.state, repoPath: st.repoPath, designPath: st.designPath, stopReason: st.stopReason }, blocker)
+    : null;
+  for (const l of renderStatus(st, why)) process.stdout.write(l + "\n");
 }
 
 /** Delete a run's records and artifacts, after confirmation unless --yes. */
@@ -424,7 +495,7 @@ async function cmdClean(ctl: Controller, runId: string, yes: boolean): Promise<v
       out(`! The run is not completed: its progress is lost, and re-running 'qfb build' starts a new run.`);
     }
     if (!process.stdin.isTTY) throw new Error("Confirmation required; re-run with --yes.");
-    if (!(await confirm(`Delete ${runId}? [y/N] `))) {
+    if (!/^y(es)?$/i.test((await processIO().ask(`Delete ${runId}? [y/N] `)).trim())) {
       out("Nothing deleted.");
       return;
     }
@@ -473,7 +544,7 @@ function tailFile(path: string, n: number): string[] {
 }
 
 /** Drive ctl.run(runId) while repainting a compact progress block in place. */
-async function runWithProgress(ctl: Controller, runId: string, enabled: boolean): Promise<string> {
+async function runWithProgress(ctl: Controller, runId: string, enabled: boolean): Promise<StateName> {
   const interactive = enabled && Boolean(process.stdout.isTTY);
   let frame = 0;
   let drawn = 0;

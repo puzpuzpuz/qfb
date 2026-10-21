@@ -2,19 +2,20 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, realpathSync, rmSync } from "node:fs";
 import { writeFile, readFile } from "node:fs/promises";
 import { hostname } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Store } from "./store.ts";
 import type { RunRow, SessionRow } from "./store.ts";
 import type { PaneLabel } from "./adapters/herdr.ts";
 import type { PiLaunchResult, SessionRef } from "./adapters/pi.ts";
 import { assertTransition, isActive, isOrthogonal, resumeTarget } from "./stateMachine.ts";
 import { extractPlan, renderManifest } from "./plan.ts";
-import { checkArtifact, confidentialityFailures, mechanicalGate } from "./gating.ts";
+import type { PlanExtraction } from "./plan.ts";
+import { checkArtifact, confidentialityProblems, mechanicalGate } from "./gating.ts";
 import type { ExpectedArtifact } from "./gating.ts";
 import { parseReviewReport, selectActionableFindings, isAcceptable, AmbiguousReportError } from "./report.ts";
 import { findingIdentity, bugIdentity, detectNoProgress } from "./identity.ts";
 import { foldForMatch, scanForDenyTerms } from "./confidentiality.ts";
-import { Git, GitError } from "./git.ts";
+import { Git, GitError, diffFiles } from "./git.ts";
 import { shellTestRunner } from "./procs.ts";
 import type { TestRunner } from "./procs.ts";
 import { State, AgentStatus, FixOutcome, DEFAULT_CONFIG, validateConfig } from "./types.ts";
@@ -22,6 +23,8 @@ import type { PiAdapter } from "./adapters/pi.ts";
 import type { HerdrAdapter } from "./adapters/herdr.ts";
 import type {
   AddedContent,
+  Blocker,
+  Decision,
   GitSnapshot,
   PlanStep,
   ReviewReport,
@@ -58,8 +61,11 @@ export interface ControllerDeps {
   store: Store;
   pi: PiAdapter;
   herdr: HerdrAdapter;
-  /** Factory so each run targets its own checkout; defaults to real Git. */
-  makeGit?: (repoPath: string) => GitLike;
+  /**
+   * Factory so each run targets its own checkout; defaults to real Git.
+   * `exclude`: repository-relative paths that are not part of the feature.
+   */
+  makeGit?: (repoPath: string, opts: { exclude: string[] }) => GitLike;
   /** Root directory for durable artifacts (outside the QuestDB tree). */
   artifactRoot: string;
   /** Re-runs claimed validation commands; defaults to `sh -c` in a process group. */
@@ -116,7 +122,42 @@ export class PlanChangedError extends Error {
   }
 }
 
-export class PauseSignal extends Error {}
+/** How `qfb build` finishes a run: whether (and against what) it opens a PR. */
+export interface BuildOptions {
+  pr: boolean;
+  prBase: string;
+  prTitle: string | null;
+}
+
+/** A plan extracted from a design and merged with the stored steps; not stored yet. */
+interface ProposedPlan {
+  ex: PlanExtraction;
+  merged: (PlanStep & { attempts: number })[];
+  /** Step diff against the stored plan (`+` new, `-` removed, blank kept). */
+  diff: string[];
+  changed: boolean;
+}
+
+/** What approving a design (as on disk, or a drafted revision) would do; nothing is changed. */
+export interface DesignPreview {
+  /** sha256 of the reviewed text; adoptDesign refuses anything else. */
+  hash: string;
+  /** Unified diff of the design: approved -> on disk, or on disk -> draft. Null when there is nothing to compare. */
+  designDiff: string | null;
+  /** Step diff, empty when the steps are unchanged. */
+  planDiff: string[];
+  steps: number;
+  ambiguous: boolean;
+  notes: string[];
+}
+
+export class PauseSignal extends Error {
+  readonly blocker: Blocker;
+  constructor(message: string, blocker: Blocker) {
+    super(message);
+    this.blocker = blocker;
+  }
+}
 /** Unwinds the run loop after the controller already persisted a stop/reconciliation. */
 class HaltSignal extends Error {}
 
@@ -140,6 +181,14 @@ const PLAN_AMBIGUOUS = "plan-ambiguous";
 const UNSCANNABLE_PENDING = "unscannable-pending";
 /** Files (path + content digest) an operator vetted by hand; the scan skips exactly these. */
 const UNSCANNABLE_ACCEPTED = "unscannable-accepted";
+/** Why the run stopped (a Blocker), while it is in an orthogonal state. */
+const BLOCKER = "blocker";
+/** Repository-relative docs the operator keeps in the checkout but out of the feature. */
+const LOCAL_DOCS = "local-docs";
+/** BuildOptions of a run started (or last re-run) by `qfb build`. */
+const BUILD_OPTIONS = "build-options";
+/** What may be kept local: documents, never code. */
+const LOCAL_DOC_FILE = /\.(md|markdown|txt|rst|adoc)$/i;
 
 /** The artifact `kind` each session kind must write. */
 const ARTIFACT_KIND: Record<string, TaskArtifact["kind"]> = {
@@ -149,6 +198,7 @@ const ARTIFACT_KIND: Record<string, TaskArtifact["kind"]> = {
   "hardening-fix": "bug",
   review: "review",
   fix: "fix",
+  "design-revision": "design",
 };
 
 const NO_CONTENT: AddedContent = { files: [], unscannable: [] };
@@ -165,7 +215,7 @@ export class Controller {
   private readonly store: Store;
   private readonly pi: PiAdapter;
   private readonly herdr: HerdrAdapter;
-  private readonly makeGit: (repoPath: string) => GitLike;
+  private readonly makeGit: (repoPath: string, opts: { exclude: string[] }) => GitLike;
   private readonly artifactRoot: string;
   private readonly runTest: TestRunner;
   private readonly orphanGraceMs: number;
@@ -180,7 +230,7 @@ export class Controller {
     this.store = deps.store;
     this.pi = deps.pi;
     this.herdr = deps.herdr;
-    this.makeGit = deps.makeGit ?? ((p) => new Git(p));
+    this.makeGit = deps.makeGit ?? ((p, o) => new Git(p, o));
     this.artifactRoot = deps.artifactRoot;
     this.runTest = deps.runTest ?? shellTestRunner;
     this.orphanGraceMs = deps.orphanGraceMs ?? 10_000;
@@ -203,7 +253,7 @@ export class Controller {
     preparedPlanPath: string;
   } {
     const runId = `run-${randomUUID().slice(0, 8)}`;
-    const design = readFileSync(opts.designPath, "utf8");
+    const design = readFileSync(resolve(opts.designPath), "utf8");
     const designHash = sha256(design);
 
     const config = { ...DEFAULT_CONFIG, ...opts.config };
@@ -218,13 +268,15 @@ export class Controller {
       }
     }
 
-    const git = this.makeGit(opts.repoPath);
+    const repoPath = resolve(opts.repoPath);
+    const designPath = resolve(opts.designPath);
+    const git = this.makeGit(repoPath, { exclude: localDocsOf(repoPath, designPath, []) });
     // Anchor the review range: a ref such as origin/master moves on the next fetch.
     let baseSha: string;
     try {
       baseSha = git.resolveCommit(opts.base);
     } catch (e) {
-      throw new Error(`Base ${JSON.stringify(opts.base)} does not resolve to a commit in ${opts.repoPath}: ${(e as Error).message}`);
+      throw new Error(`Base ${JSON.stringify(opts.base)} does not resolve to a commit in ${repoPath}: ${(e as Error).message}`);
     }
     if (config.checkpointPolicy === "commit" && !git.isClean()) {
       // Commit checkpoints stage the whole gated tree; inherited changes would be swept in.
@@ -236,11 +288,11 @@ export class Controller {
 
     this.store.createRun({
       id: runId,
-      repoPath: opts.repoPath,
+      repoPath,
       branch: git.branch(),
       baseRef: baseSha,
       baseSpec: opts.base,
-      designPath: opts.designPath,
+      designPath,
       designHash,
       config,
       state: State.CREATED,
@@ -320,6 +372,7 @@ export class Controller {
         if (unfinished && to !== State.READY) to = State.IMPLEMENTING;
         this.transition(runId, run.state, to, "approve");
       });
+      this.keepApprovedCopy(runId, design);
     });
   }
 
@@ -344,25 +397,37 @@ export class Controller {
    * that yields no steps is not stored, so earlier progress is never lost.
    */
   private replan(run: RunRow, design: string, hash: string): PlanInfo {
-    const ex = extractPlan(design);
+    const plan = this.planFor(run, design);
     const runId = run.id;
-    const preparedPlanPath = this.artifactPath(runId, "prepared-plan.md");
-    const header =
-      `<!-- QFB prepared plan for ${runId} -->\n` +
-      `<!-- source design/handoff: ${run.designPath} (sha256 ${hash}) -->\n` +
-      `<!-- approve with: qfb approve ${runId} -->\n\n`;
-    const old = this.store.getSteps(runId);
-    if (ex.steps.length === 0) {
-      if (old.length === 0) {
+    const { ex } = plan;
+    if (plan.merged.length === 0) {
+      const preparedPlanPath = this.artifactPath(runId, "prepared-plan.md");
+      if (this.store.getSteps(runId).length === 0) {
         // Nothing to lose: show the operator why nothing was extracted.
-        writeFileSync(preparedPlanPath, header + renderManifest([], ex.notes));
+        writeFileSync(preparedPlanPath, this.manifestHeader(run, hash) + renderManifest([], ex.notes));
         this.store.setCounter(runId, "prepared-plan-path", preparedPlanPath);
         this.store.setCounter(runId, "plan-strategy", ex.strategy);
       }
       return { changed: false, diff: [], steps: 0, ambiguous: true, notes: ex.notes, strategy: ex.strategy, preparedPlanPath };
     }
+    const preparedPlanPath = this.storePlan(run, plan, hash);
+    return {
+      changed: plan.changed,
+      diff: plan.changed ? plan.diff : [],
+      steps: plan.merged.length,
+      ambiguous: ex.ambiguous,
+      notes: ex.notes,
+      strategy: ex.strategy,
+      preparedPlanPath,
+    };
+  }
 
-    const fresh = this.store.getSessionCount(runId) === 0;
+  /** The plan `design` yields, merged with the stored steps as replan describes. Changes nothing. */
+  private planFor(run: RunRow, design: string): ProposedPlan {
+    const ex = extractPlan(design);
+    if (ex.steps.length === 0) return { ex, merged: [], diff: [], changed: false };
+    const old = this.store.getSteps(run.id);
+    const fresh = this.store.getSessionCount(run.id) === 0;
     let nextId = old.reduce((m, s) => Math.max(m, Number(s.id.replace(/^S/, "")) || 0), 0) + 1;
     const used = new Set<string>();
     const diff: string[] = [];
@@ -377,25 +442,31 @@ export class Controller {
     });
     for (const o of old) if (!used.has(o.id)) diff.push(`- ${o.id}  ${firstLine(o.text)}`);
     const changed = JSON.stringify(old.map((s) => [s.id, s.text])) !== JSON.stringify(merged.map((s) => [s.id, s.text]));
+    return { ex, merged, diff, changed };
+  }
 
+  /** Store a plan with at least one step, and its manifest; returns the manifest path. */
+  private storePlan(run: RunRow, plan: ProposedPlan, hash: string): string {
+    const runId = run.id;
+    const preparedPlanPath = this.artifactPath(runId, "prepared-plan.md");
     this.store.tx(() => {
-      if (changed) this.store.replaceSteps(runId, merged);
+      if (plan.changed) this.store.replaceSteps(runId, plan.merged);
       this.store.setCounter(runId, "prepared-plan-path", preparedPlanPath);
-      this.store.setCounter(runId, "plan-strategy", ex.strategy);
+      this.store.setCounter(runId, "plan-strategy", plan.ex.strategy);
       this.store.setCounter(runId, PLAN_SOURCE_HASH, hash);
-      if (ex.ambiguous) this.store.setCounter(runId, PLAN_AMBIGUOUS, JSON.stringify(ex.notes));
+      if (plan.ex.ambiguous) this.store.setCounter(runId, PLAN_AMBIGUOUS, JSON.stringify(plan.ex.notes));
       else this.store.deleteCounter(runId, PLAN_AMBIGUOUS);
-      writeFileSync(preparedPlanPath, header + renderManifest(merged, ex.notes));
+      writeFileSync(preparedPlanPath, this.manifestHeader(run, hash) + renderManifest(plan.merged, plan.ex.notes));
     });
-    return {
-      changed,
-      diff: changed ? diff : [],
-      steps: merged.length,
-      ambiguous: ex.ambiguous,
-      notes: ex.notes,
-      strategy: ex.strategy,
-      preparedPlanPath,
-    };
+    return preparedPlanPath;
+  }
+
+  private manifestHeader(run: RunRow, hash: string): string {
+    return (
+      `<!-- QFB prepared plan for ${run.id} -->\n` +
+      `<!-- source design/handoff: ${run.designPath} (sha256 ${hash}) -->\n` +
+      `<!-- approve with: qfb approve ${run.id} -->\n\n`
+    );
   }
 
   private planInfo(runId: string): PlanInfo {
@@ -433,7 +504,9 @@ export class Controller {
         throw new Error(`Run ${runId} is not approved (state=${run0.state}); run 'qfb approve ${runId}' first.`);
       }
       // Design-integrity reconciliation (Section 5 / Section 14).
-      if (this.designChanged(runId)) throw new PauseSignal(DESIGN_CHANGED);
+      const missing = this.designMissing(run0);
+      if (missing) throw new PauseSignal(missing, { kind: "design-missing", path: run0.designPath });
+      if (this.designChanged(runId)) throw new PauseSignal(DESIGN_CHANGED, { kind: "design-changed" });
       // Crash recovery (Section 9): never start a writer next to a live one.
       await this.reconcileInflight(runId);
 
@@ -444,11 +517,12 @@ export class Controller {
         if (this.store.getCounter(runId, STOP_REQUEST) !== null) this.haltForStop(runId, null);
         if (this.store.getCounter(runId, PAUSE_REQUEST) !== null) {
           // Graceful: honored between sessions, never interrupting an active write.
-          this.stopRun(runId, State.PAUSED, "Operator requested pause.");
+          this.stopRun(runId, State.PAUSED, "Operator requested pause.", { kind: "operator-pause" });
           continue;
         }
         if (this.sessionsSinceEpoch(runId) >= run.config.maxTotalSessions) {
-          this.stopRun(runId, State.FAILED, "Hard ceiling on total Pi sessions reached.");
+          const detail = "Hard ceiling on total Pi sessions reached.";
+          this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId: null });
           continue;
         }
         await this.advance(runId);
@@ -456,7 +530,7 @@ export class Controller {
       throw new Error("Run loop exceeded guard limit.");
     } catch (e) {
       if (e instanceof PauseSignal) {
-        this.stopRun(runId, State.PAUSED, e.message);
+        this.stopRun(runId, State.PAUSED, e.message, e.blocker);
         return State.PAUSED;
       }
       if (e instanceof HaltSignal) return this.requireRun(runId).state;
@@ -465,7 +539,8 @@ export class Controller {
         // session's outcome (if any) is kept and re-gated after the fix.
         this.holdOutcome(runId);
         this.stopRun(runId, State.PAUSED,
-          `Git failed, so the checkout could not be verified: ${e.message}. Fix the cause, then 'qfb resume ${runId}'.`);
+          `Git failed, so the checkout could not be verified: ${e.message}. Fix the cause, then 'qfb resume ${runId}'.`,
+          { kind: "git-error", message: e.message });
         return State.PAUSED;
       }
       throw e;
@@ -525,7 +600,7 @@ export class Controller {
       this.transition(runId, State.IMPLEMENTING, State.HARDENING_IDENTIFY, "all-steps-done");
       return;
     }
-    const git = this.makeGit(run.repoPath);
+    const git = this.gitFor(run);
 
     let got = this.unconsumed(runId, "implementation", next.id);
     if (!got) {
@@ -551,13 +626,15 @@ export class Controller {
 
     // Claimed BLOCKED / NEEDS_DECISION route to orthogonal states (Section 6 table).
     if (claimed === AgentStatus.NEEDS_DECISION) {
-      this.stopRun(runId, State.PAUSED, `Step ${next.id} needs a human decision: ${a?.summary ?? ""}`);
+      this.stopRun(runId, State.PAUSED, `Step ${next.id} needs a human decision: ${a?.summary ?? ""}`,
+        decisionBlocker("agent", State.IMPLEMENTING, next.id, a, row.artifactPath));
       return;
     }
     if (claimed === AgentStatus.BLOCKED) {
       this.store.tx(() => {
         this.store.setStepStatus(runId, next.id, "blocked");
-        this.stopRun(runId, State.BLOCKED, `Step ${next.id} blocked: ${a?.summary ?? ""}`);
+        this.stopRun(runId, State.BLOCKED, `Step ${next.id} blocked: ${a?.summary ?? ""}`,
+          decisionBlocker("blocked", State.IMPLEMENTING, next.id, a, row.artifactPath));
       });
       return;
     }
@@ -605,13 +682,15 @@ export class Controller {
       this.transition(runId, State.IMPLEMENTING, State.VERIFYING_STEP, "session-settled", evidence);
       this.store.setCounter(runId, `gate-failures:${next.id}`, JSON.stringify(reasons));
       if (gate.pause) {
-        this.stopRun(runId, State.PAUSED, `Step ${next.id} failed a scope/integrity gate: ${reasons.join("; ")}`);
+        this.stopRun(runId, State.PAUSED, `Step ${next.id} failed a scope/integrity gate: ${reasons.join("; ")}`,
+          { kind: "gate", stage: State.IMPLEMENTING, stepId: next.id, problems: gate.problems });
         return;
       }
       const used = this.sessionsSinceEpoch(runId, { kind: "implementation", stepId: next.id });
       if (used >= run.config.maxImplAttemptsPerStep) {
         this.store.setStepStatus(runId, next.id, "failed");
-        this.stopRun(runId, State.FAILED, `Step ${next.id} exhausted ${used} attempt(s): ${reasons.join("; ")}`);
+        const detail = `Step ${next.id} exhausted ${used} attempt(s): ${reasons.join("; ")}`;
+        this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId: next.id });
         return;
       }
       // Remain the active step for a bounded correction attempt.
@@ -633,7 +712,7 @@ export class Controller {
     const pass = this.store.getNumber(runId, "hardening-pass");
     const stepId = `${key}-p${pass}`;
     const readOnly = key === "identify";
-    const git = this.makeGit(run.repoPath);
+    const git = this.gitFor(run);
 
     let got = this.unconsumed(runId, kind, stepId);
     if (!got) {
@@ -653,16 +732,18 @@ export class Controller {
     const a = result.artifact;
     const claimed = a?.status;
     if (claimed === AgentStatus.NEEDS_DECISION) {
-      this.stopRun(runId, State.PAUSED, `Hardening ${key} stage needs a human decision: ${a?.summary ?? ""}`);
+      this.stopRun(runId, State.PAUSED, `Hardening ${key} stage needs a human decision: ${a?.summary ?? ""}`,
+        decisionBlocker("agent", stage, stepId, a, row.artifactPath));
       return;
     }
     if (claimed === AgentStatus.BLOCKED) {
-      this.stopRun(runId, State.BLOCKED, `Hardening ${key} stage blocked: ${a?.summary ?? ""}`);
+      this.stopRun(runId, State.BLOCKED, `Hardening ${key} stage blocked: ${a?.summary ?? ""}`,
+        decisionBlocker("blocked", stage, stepId, a, row.artifactPath));
       return;
     }
     if (key === "fix" && a?.fixOutcome && a.fixOutcome !== FixOutcome.CLEAN) {
-      this.stopRun(runId, State.FAILED,
-        `Hardening bug fix returned ${a.fixOutcome}; stopping normal progression (evidence: ${row.artifactPath}).`);
+      const detail = `Hardening bug fix returned ${a.fixOutcome}; stopping normal progression (evidence: ${row.artifactPath}).`;
+      this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId });
       return;
     }
 
@@ -694,13 +775,14 @@ export class Controller {
       const budget = key === "fix" ? run.config.maxHardeningFixIterations : run.config.maxHardeningTestAttempts;
       this.store.tx(() => {
         if (gate.pause) {
-          this.stopRun(runId, State.PAUSED, `Hardening ${key} stage failed a scope/integrity gate: ${reasons.join("; ")}`);
+          this.stopRun(runId, State.PAUSED, `Hardening ${key} stage failed a scope/integrity gate: ${reasons.join("; ")}`,
+            { kind: "gate", stage, stepId, problems: gate.problems });
           return;
         }
         const used = this.sessionsSinceEpoch(runId, { kind, stepId });
         if (used >= budget) {
-          this.stopRun(runId, State.FAILED,
-            `Hardening ${key} stage (pass ${pass}) exhausted ${used} attempt(s): ${reasons.join("; ")}`);
+          const detail = `Hardening ${key} stage (pass ${pass}) exhausted ${used} attempt(s): ${reasons.join("; ")}`;
+          this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId });
           return;
         }
         this.store.setCounter(runId, `gate-failures:${kind}:${stepId}`, JSON.stringify(reasons));
@@ -757,13 +839,14 @@ export class Controller {
       }
       this.store.setCounter(runId, "open-bugs", JSON.stringify(bugs));
       if (survivors.length > 0) {
-        this.stopRun(runId, State.FAILED, `Hardening bug(s) recur with unchanged identity (no progress): ${survivors.join(", ")}`);
+        const detail = `Hardening bug(s) recur with unchanged identity (no progress): ${survivors.join(", ")}`;
+        this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId });
         return;
       }
       const used = this.sessionsSinceEpoch(runId, { kind, stepId });
       if (used >= run.config.maxHardeningFixIterations) {
-        this.stopRun(runId, State.FAILED,
-          `Hardening fix budget exhausted with ${bugs.length} bug(s) still failing: ${bugs.map((b) => b.id).join(", ")}`);
+        const detail = `Hardening fix budget exhausted with ${bugs.length} bug(s) still failing: ${bugs.map((b) => b.id).join(", ")}`;
+        this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId });
         return;
       }
       this.transition(runId, stage, stage, "hardening-fix-retry", `${bugs.length} bug(s) still open`);
@@ -773,14 +856,15 @@ export class Controller {
   // ------------------------------------------------- Phase D: review/fix
   private async doReview(runId: string): Promise<void> {
     const run = this.requireRun(runId);
-    const git = this.makeGit(run.repoPath);
+    const git = this.gitFor(run);
 
     let got = this.unconsumed(runId, "review", "review");
     if (!got) {
       const used = this.sessionsSinceEpoch(runId, { kind: "review" });
       if (used >= run.config.maxReviewIterations) {
         // Do NOT auto-accept an incomplete review on hitting the cap (Section 8.2).
-        this.stopRun(runId, State.FAILED, `Review iteration limit (${run.config.maxReviewIterations}) reached without acceptance.`);
+        const detail = `Review iteration limit (${run.config.maxReviewIterations}) reached without acceptance.`;
+        this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId: null });
         return;
       }
       const n = this.store.countSessions(runId, { kind: "review" }) + 1;
@@ -815,11 +899,13 @@ export class Controller {
       verifiedTests: [],
     });
     if (!gate.passed) {
-      this.stopRun(runId, State.PAUSED, `Review session rejected by the read-only gate: ${gate.failures.join("; ")}`);
+      this.stopRun(runId, State.PAUSED, `Review session rejected by the read-only gate: ${gate.failures.join("; ")}`,
+        { kind: "gate", stage: State.REVIEWING, stepId: "review", problems: gate.problems });
       return;
     }
     if (!a!.reviewReportPath || !existsSync(a!.reviewReportPath)) {
-      this.stopRun(runId, State.PAUSED, "Review session did not preserve a raw review-pr report.");
+      const detail = "Review session did not preserve a raw review-pr report.";
+      this.stopRun(runId, State.PAUSED, detail, { kind: "review", detail, reportPath: null });
       return;
     }
     const raw = await readFile(a!.reviewReportPath, "utf8");
@@ -829,7 +915,8 @@ export class Controller {
       report = parseReviewReport(raw);
     } catch (e) {
       if (e instanceof AmbiguousReportError) {
-        this.stopRun(runId, State.PAUSED, `Review report ambiguous — cannot extract verdict/findings: ${e.message}`);
+        this.stopRun(runId, State.PAUSED, `Review report ambiguous — cannot extract verdict/findings: ${e.message}`,
+          { kind: "review", detail: e.message, reportPath: a!.reviewReportPath! });
         return;
       }
       throw e;
@@ -841,7 +928,21 @@ export class Controller {
     if (report.verdict === "needs-discussion") {
       this.store.tx(() => {
         record();
-        this.stopRun(runId, State.PAUSED, "Review returned needs-discussion; a human decision is required.");
+        this.stopRun(runId, State.PAUSED, "Review returned needs-discussion; a human decision is required.", {
+          kind: "decision",
+          source: "review",
+          stage: State.REVIEWING,
+          stepId: "review",
+          question:
+            "The review needs a decision before it can conclude:\n" +
+            (report.findings.length
+              ? report.findings.map((f) => `- [${f.id}, ${f.severity}] ${f.location}: ${f.evidence}`).join("\n")
+              : "(the report lists no findings; see the report)"),
+          options: [],
+          recommended: null,
+          context: "",
+          evidencePath: a!.reviewReportPath!,
+        });
       });
       return;
     }
@@ -851,7 +952,8 @@ export class Controller {
       // Every writer stage was scanned, but a pause can be resumed without the
       // leak being removed (e.g. fix-pr's resumes straight into review).
       const { added } = this.writerEvidence(run, git);
-      const leaks = confidentialityFailures(added, run.denyList);
+      const leakProblems = confidentialityProblems(added, run.denyList);
+      const leaks = leakProblems.map((p) => p.message);
       this.noteUnscannable(runId, leaks.length > 0 ? added.unscannable : []);
       if (leaks.length > 0 && leaks.length === added.unscannable.length) {
         this.holdForVetting(runId, added.unscannable, "Final confidentiality check of the reviewed candidate");
@@ -862,7 +964,8 @@ export class Controller {
           record();
           this.stopRun(runId, State.PAUSED,
             `Final confidentiality check of the reviewed candidate failed: ${leaks.join(" ")} ` +
-              `Remove the leak, then 'qfb resume ${runId}' (a fresh review follows).`);
+              `Remove the leak, then 'qfb resume ${runId}' (a fresh review follows).`,
+            { kind: "gate", stage: State.REVIEWING, stepId: "final", problems: leakProblems });
         });
         return;
       }
@@ -875,13 +978,19 @@ export class Controller {
       this.store.tx(() => {
         record();
         if (final.dirtyFingerprint !== candidate.dirtyFingerprint || final.head !== candidate.head) {
-          this.stopRun(runId, State.PAUSED, "Checkout changed during final verification; the review result is stale and cannot be accepted.");
+          const detail = "Checkout changed during final verification; the review result is stale and cannot be accepted.";
+          this.stopRun(runId, State.PAUSED, detail, { kind: "stale", detail });
           return;
         }
         if (failing.length > 0) {
           this.stopRun(runId, State.PAUSED,
             `Final regression run failed on the reviewed candidate: ${failing.map((t) => `"${t.command}" exit ${t.exitCode} (log: ${t.logPath})`).join("; ")}. ` +
-              `Fix the cause (or, if a command is obsolete, remove it from ${this.suitePath(runId)}), then 'qfb resume ${runId}'.`);
+              `Fix the cause (or, if a command is obsolete, remove it from ${this.suitePath(runId)}), then 'qfb resume ${runId}'.`,
+            {
+              kind: "regression",
+              failing: failing.map((t) => ({ command: t.command, exitCode: t.exitCode, logPath: t.logPath })),
+              suitePath: this.suitePath(runId),
+            });
           return;
         }
         const accepted: AcceptedCandidate = { branch: candidate.branch, head: candidate.head, fingerprint: candidate.dirtyFingerprint };
@@ -903,7 +1012,17 @@ export class Controller {
         : "the review is not acceptable but produced no actionable findings";
       this.store.tx(() => {
         record();
-        this.stopRun(runId, State.PAUSED, `Cannot auto-remediate: ${why}; a human decision is required.`);
+        this.stopRun(runId, State.PAUSED, `Cannot auto-remediate: ${why}; a human decision is required.`, {
+          kind: "decision",
+          source: "remediation",
+          stage: State.REVIEWING,
+          stepId: "review",
+          question: `The review cannot be fixed automatically: ${why}. How should QFB proceed?`,
+          options: [],
+          recommended: null,
+          context: "",
+          evidencePath: a!.reviewReportPath!,
+        });
       });
       return;
     }
@@ -917,7 +1036,8 @@ export class Controller {
       record();
       this.store.setCounter(runId, "finding-identity-history", JSON.stringify(history));
       if (survivors.length > 0) {
-        this.stopRun(runId, State.FAILED, `Blocker(s) survive remediation without progress: ${survivors.join(", ")}`);
+        const detail = `Blocker(s) survive remediation without progress: ${survivors.join(", ")}`;
+        this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId: null });
         return;
       }
       // Stash selected findings for the fix session, then transition.
@@ -928,7 +1048,7 @@ export class Controller {
 
   private async doFix(runId: string): Promise<void> {
     const run = this.requireRun(runId);
-    const git = this.makeGit(run.repoPath);
+    const git = this.gitFor(run);
     const findings = JSON.parse(this.store.getCounter(runId, "pending-findings") ?? "[]");
 
     let got = this.unconsumed(runId, "fix", "fix");
@@ -948,14 +1068,16 @@ export class Controller {
     const { result, before, row } = got;
     const a = result.artifact;
     if (a?.status === AgentStatus.NEEDS_DECISION) {
-      this.stopRun(runId, State.PAUSED, `fix-pr needs a human decision: ${a.summary}`);
+      this.stopRun(runId, State.PAUSED, `fix-pr needs a human decision: ${a.summary}`,
+        decisionBlocker("agent", State.FIXING, "fix", a, row.artifactPath));
       return;
     }
     const outcome = a?.fixOutcome;
     if (outcome !== FixOutcome.CLEAN) {
       // Only Clean may advance the normal workflow (Section 3).
       const what = a ? `returned ${outcome ?? "no fixOutcome"}` : `left no valid artifact (${got.problem ?? "unknown"})`;
-      this.stopRun(runId, State.FAILED, `fix-pr ${what}; stopping normal progression.`);
+      const detail = `fix-pr ${what}; stopping normal progression.`;
+      this.stopRun(runId, State.FAILED, detail, { kind: "budget", detail, stepId: null });
       return;
     }
 
@@ -983,9 +1105,15 @@ export class Controller {
     if (!gate.passed || a!.status !== AgentStatus.DONE) {
       this.store.tx(() => {
         this.transition(runId, State.FIXING, State.VERIFYING_FIX, "fix-claimed-clean", evidence);
-        this.stopRun(runId, gate.pause ? State.PAUSED : State.FAILED,
+        const detail =
           `fix-pr claimed Clean but mechanical verification failed: ${reasons.join("; ")}` +
-            (gate.vetOnly ? ` If the file(s) are clean, 'qfb resume ${runId} --accept-unscannable'.` : ""));
+          (gate.vetOnly ? ` If the file(s) are clean, 'qfb resume ${runId} --accept-unscannable'.` : "");
+        this.stopRun(runId, gate.pause ? State.PAUSED : State.FAILED, detail,
+          !gate.pause
+            ? { kind: "budget", detail, stepId: null }
+            : gate.vetOnly
+              ? { kind: "unscannable", files: gate.unscannable }
+              : { kind: "gate", stage: State.FIXING, stepId: "fix", problems: gate.problems });
       });
       return;
     }
@@ -1013,7 +1141,7 @@ export class Controller {
       try {
         const cur = this.requireRun(runId);
         if (!isActive(cur.state)) throw new Error(`Run ${runId} is ${cur.state}; nothing to pause.`);
-        this.stopRun(runId, State.PAUSED, "Operator requested pause.");
+        this.stopRun(runId, State.PAUSED, "Operator requested pause.", { kind: "operator-pause" });
       } finally {
         this.store.releaseLock(runId);
       }
@@ -1036,14 +1164,15 @@ export class Controller {
         const open = this.store.openSessions(runId);
         for (const s of open) if (await this.pi.isRunning(ref(s))) await this.pi.terminate(ref(s));
         const cur = this.requireRun(runId);
-        const git = this.makeGit(cur.repoPath);
+        const git = this.gitFor(cur);
         const evidence = open.map((s) => this.preserveInterrupted(cur, git, s));
         this.store.tx(() => {
           for (const s of open) this.retireSession(s.rowId, "stopped");
           this.store.deleteCounter(runId, STOP_REQUEST);
           this.stopRun(runId, State.RECONCILIATION,
             `Operator stopped the run${evidence.length ? `; partial changes preserved at ${evidence.join(", ")}` : ""}. ` +
-              `Inspect the checkout, then 'qfb resume ${runId}'.`);
+              `Inspect the checkout, then 'qfb resume ${runId}'.`,
+            { kind: "interrupted", evidence });
         });
       } finally {
         this.store.releaseLock(runId);
@@ -1063,59 +1192,395 @@ export class Controller {
    * merely because a controller restarts).
    */
   async resume(runId: string, opts: { acceptUnscannable?: boolean } = {}): Promise<StateName> {
-    if (!this.store.acquireLock(runId)) throw new Error(this.lockedMessage(runId));
+    return this.withRunLockAsync(runId, () => this.resumeLocked(runId, opts));
+  }
+
+  /**
+   * resume, with the run lock held. `decision` records the operator's answer
+   * for every later session; `adopt` approves the reviewed design and plan in
+   * the same transaction (a revised plan's unfinished steps then come first).
+   */
+  private async resumeLocked(
+    runId: string,
+    opts: {
+      acceptUnscannable?: boolean;
+      decision?: { question: string; answer: string; designRevised: boolean };
+      adopt?: { text: string; hash: string; plan: ProposedPlan };
+    },
+  ): Promise<StateName> {
+    const run = this.requireRun(runId);
+    if (!isOrthogonal(run.state)) throw new Error(`Run ${runId} is ${run.state}; nothing to resume.`);
+    const missing = this.designMissing(run);
+    if (missing) throw new Error(missing);
+    if (!opts.adopt && this.designChanged(runId)) {
+      this.stopRun(runId, State.PAUSED, DESIGN_CHANGED, { kind: "design-changed" });
+      throw new Error(`${DESIGN_CHANGED} Review the edited design, then 'qfb approve ${runId}'.`);
+    }
+    // The operator vouches for files the confidentiality scan could not read:
+    // exactly the content the gate saw (path + digest), nothing later.
+    const vetted = opts.acceptUnscannable ? this.unscannableList(runId, UNSCANNABLE_PENDING) : [];
+    if (opts.acceptUnscannable && vetted.length === 0) {
+      throw new Error(`Run ${runId} has no unscannable files awaiting a decision.`);
+    }
+    await this.assertNoLiveSession(runId);
+    const open = this.store.openSessions(runId);
+    const git = this.gitFor(run);
+    const evidence = open.map((s) => this.preserveInterrupted(run, git, s));
+    const blocker = this.blocker(runId);
+    let target = this.resumeStateOf(runId);
+    const retry = run.state === State.FAILED;
+    this.store.tx(() => {
+      for (const s of open) this.retireSession(s.rowId, "interrupted");
+      if (opts.adopt) {
+        this.storePlan(run, opts.adopt.plan, opts.adopt.hash);
+        this.store.setDesignHash(runId, opts.adopt.hash);
+        this.store.setApproved(runId);
+        // A held session outcome belongs to the previous plan: never re-process it.
+        this.store.consumeEndedSessions(runId);
+        const unfinished = this.store.getSteps(runId).some((s) => s.status !== "done");
+        if (unfinished && target !== State.READY) target = State.IMPLEMENTING;
+      }
+      if (opts.decision) {
+        this.store.addDecision(runId, {
+          stage: blocker && "stage" in blocker ? blocker.stage : target,
+          stepId: blocker && "stepId" in blocker && blocker.stepId ? blocker.stepId : "-",
+          ...opts.decision,
+        });
+      }
+      this.reopenSteps(runId);
+      if (retry) {
+        this.store.setNumber(runId, BUDGET_EPOCH, this.store.maxSessionRowId(runId));
+        this.store.deleteCounter(runId, "finding-identity-history");
+        this.store.deleteCounter(runId, "bug-identity-history");
+      }
+      this.store.deleteCounter(runId, PAUSE_REQUEST);
+      this.store.deleteCounter(runId, STOP_REQUEST);
+      if (vetted.length > 0) {
+        const accepted = this.unscannableList(runId, UNSCANNABLE_ACCEPTED);
+        this.store.setCounter(runId, UNSCANNABLE_ACCEPTED, JSON.stringify([...accepted, ...vetted]));
+        this.store.deleteCounter(runId, UNSCANNABLE_PENDING);
+      }
+      this.store.setStopReason(runId, null);
+      const op = retry ? "operator-retry" : opts.adopt ? "design-approved" : opts.decision ? "operator-decision" : "operator-resume";
+      this.transition(runId, run.state, target, op,
+        JSON.stringify({
+          previousStopReason: run.stopReason,
+          evidence,
+          ...(vetted.length > 0 ? { vettedUnscannable: vetted } : {}),
+          ...(opts.decision ? { decision: opts.decision } : {}),
+        }));
+    });
+    if (opts.adopt) this.keepApprovedCopy(runId, opts.adopt.text);
+    return target;
+  }
+
+  /** Refuse while a session from an earlier controller may still be running: never two writers. */
+  private async assertNoLiveSession(runId: string): Promise<void> {
+    for (const s of this.store.openSessions(runId)) {
+      if (await this.pi.isRunning(ref(s))) {
+        throw new Error(
+          `Session ${s.sessionId} (pid ${s.pid} on ${s.host}) is still running; wait for it to exit or 'qfb stop ${runId}' first.`,
+        );
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- operator help
+  /** Why the run stopped, while it is paused, blocked, failed, or in reconciliation. */
+  blocker(runId: string): Blocker | null {
+    const run = this.requireRun(runId);
+    if (!isOrthogonal(run.state)) return null;
+    const v = this.store.getCounter(runId, BLOCKER);
+    return v ? (JSON.parse(v) as Blocker) : null;
+  }
+
+  /** The operator's answers so far; every session is given them. */
+  decisions(runId: string): Decision[] {
+    this.requireRun(runId);
+    return this.store.getDecisions(runId);
+  }
+
+  /** Repository-relative docs that are not part of the feature: the design (if in the checkout) and docs kept local. */
+  localDocs(runId: string): string[] {
+    const run = this.requireRun(runId);
+    return localDocsOf(run.repoPath, run.designPath, this.keptLocal(runId));
+  }
+
+  private keptLocal(runId: string): string[] {
+    return JSON.parse(this.store.getCounter(runId, LOCAL_DOCS) ?? "[]") as string[];
+  }
+
+  /**
+   * Keep documents the operator put in the checkout (specs, notes) out of the
+   * feature: no gate sees them and no checkpoint commits them. Documents only:
+   * QFB never hides code from its gates.
+   */
+  keepLocal(runId: string, paths: string[]): string[] {
+    return this.withRunLock(runId, () => {
+      const run = this.requireRun(runId);
+      const kept = this.keptLocal(runId);
+      for (const p of paths) {
+        const rel = relative(realOrResolved(run.repoPath), realOrResolved(resolve(run.repoPath, p)));
+        if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new Error(`${p} is not inside the checkout ${run.repoPath}.`);
+        if (!LOCAL_DOC_FILE.test(rel)) {
+          throw new Error(`${rel} is not a document (.md, .markdown, .txt, .rst, .adoc); QFB never hides code from its gates.`);
+        }
+        if (!kept.includes(rel)) kept.push(rel);
+      }
+      this.store.setCounter(runId, LOCAL_DOCS, JSON.stringify(kept));
+      return this.localDocs(runId);
+    });
+  }
+
+  /** Point the run at its design document's new location; changed content then needs approval as usual. */
+  relinkDesign(runId: string, path: string): void {
+    this.withRunLock(runId, () => {
+      this.requireRun(runId);
+      const p = resolve(path);
+      if (!existsSync(p)) throw new Error(`There is no design document at ${p}.`);
+      this.store.setDesignPath(runId, p);
+    });
+  }
+
+  /** Whether the design on disk is the approved one. */
+  designState(runId: string): "ok" | "changed" | "missing" {
+    const run = this.requireRun(runId);
+    if (this.designMissing(run)) return "missing";
+    return run.approved && this.designChanged(runId) ? "changed" : "ok";
+  }
+
+  /**
+   * What approving the design on disk, or a drafted revision of it, would do
+   * to the plan. Changes nothing; adoptDesign approves exactly what was shown.
+   */
+  previewDesign(runId: string, draftPath?: string): DesignPreview {
+    const run = this.requireRun(runId);
+    const text = readFileSync(draftPath ?? run.designPath, "utf8");
+    const plan = this.planFor(run, text);
+    const approved = this.approvedCopyPath(runId);
+    const designDiff = draftPath
+      ? labelDiff(diffFiles(run.designPath, draftPath), `${run.designPath} (current)`, "proposed revision")
+      : existsSync(approved) ? labelDiff(diffFiles(approved, run.designPath), "approved design", run.designPath) : null;
+    return {
+      hash: sha256(text),
+      designDiff,
+      planDiff: plan.changed ? plan.diff : [],
+      steps: plan.merged.length,
+      ambiguous: plan.ex.ambiguous,
+      notes: plan.ex.notes,
+    };
+  }
+
+  /**
+   * Approve the design the operator reviewed with previewDesign and continue
+   * the stopped run. With `draftPath`, the reviewed draft replaces the design
+   * document first (the previous version is kept in the run's artifacts).
+   * `hash` pins exactly what was reviewed: anything edited since is refused.
+   */
+  async adoptDesign(
+    runId: string,
+    o: { hash: string; draftPath?: string; decision?: { question: string; answer: string } },
+  ): Promise<StateName> {
+    return this.withRunLockAsync(runId, async () => {
+      const run = this.requireRun(runId);
+      if (!isOrthogonal(run.state)) {
+        throw new Error(`Run ${runId} is ${run.state}; approve its plan with 'qfb approve ${runId}'.`);
+      }
+      const missing = this.designMissing(run);
+      if (missing) throw new Error(missing);
+      const source = o.draftPath ?? run.designPath;
+      const text = readFileSync(source, "utf8");
+      if (sha256(text) !== o.hash) throw new Error(`${source} changed after it was reviewed; review it again.`);
+      const plan = this.planFor(run, text);
+      if (plan.merged.length === 0) {
+        throw new Error(`No plan steps can be extracted from ${source}; give it an ordered Implementation Plan.`);
+      }
+      await this.assertNoLiveSession(runId);
+      if (o.draftPath) {
+        writeFileSync(this.artifactPath(runId, `design-replaced-${Date.now()}.md`), readFileSync(run.designPath));
+        writeFileSync(run.designPath, text);
+      }
+      return this.resumeLocked(runId, {
+        adopt: { text, hash: o.hash, plan },
+        ...(o.decision ? { decision: { ...o.decision, designRevised: true } } : {}),
+      });
+    });
+  }
+
+  /**
+   * Answer the question the run stopped on, or give guidance for a retry, and
+   * continue. The answer is recorded and given to every later session.
+   * `option` is 1-based, as the CLI shows options.
+   */
+  async decide(runId: string, o: { option?: number; answer?: string }): Promise<StateName> {
+    return this.withRunLockAsync(runId, async () => {
+      const run = this.requireRun(runId);
+      if (!isOrthogonal(run.state)) throw new Error(`Run ${runId} is ${run.state}; there is nothing to decide.`);
+      const question = this.question(runId);
+      const answer = this.answerText(runId, o);
+      return this.resumeLocked(runId, { decision: { question, answer, designRevised: false } });
+    });
+  }
+
+  /** The question a stopped run asks: the agent's or the review's, else why it stopped. */
+  question(runId: string): string {
+    const b = this.blocker(runId);
+    if (b?.kind === "decision") return b.question;
+    return this.requireRun(runId).stopReason ?? "How should QFB proceed?";
+  }
+
+  /** The operator's answer as recorded: a chosen option (1-based), free text, or both. */
+  answerText(runId: string, o: { option?: number; answer?: string }): string {
+    const text = o.answer?.trim() ?? "";
+    if (o.option === undefined) {
+      if (!text) throw new Error("Give an answer (or choose an option).");
+      return text;
+    }
+    const b = this.blocker(runId);
+    const options = b?.kind === "decision" ? b.options : [];
+    if (!Number.isInteger(o.option) || o.option < 1 || o.option > options.length) {
+      throw new Error(options.length ? `Choose an option between 1 and ${options.length}.` : "This question has no options; give an answer.");
+    }
+    const chosen = options[o.option - 1]!;
+    return text ? `${chosen} (${text})` : chosen;
+  }
+
+  /**
+   * Ask an agent to draft the design change an operator's answer implies.
+   * Changes nothing: the draft goes to the run's artifacts, to be reviewed
+   * (previewDesign) and approved (adoptDesign) by the operator. The session
+   * is read-only: the checkout and the design must be unchanged afterwards.
+   */
+  async draftDesignRevision(
+    runId: string,
+    o: { question: string; answer: string },
+  ): Promise<{ draftPath: string; summary: string; problem: string | null }> {
+    const run0 = this.requireRun(runId);
+    const keys = [runId, repoLockKey(run0.repoPath)];
+    if (!this.store.acquireLock(keys)) {
+      throw new Error(
+        this.store.lockHolder(runId)
+          ? this.lockedMessage(runId)
+          : `Checkout ${run0.repoPath} is in use by another QFB run; only one session may use a checkout at a time.`,
+      );
+    }
     try {
       const run = this.requireRun(runId);
-      if (!isOrthogonal(run.state)) throw new Error(`Run ${runId} is ${run.state}; nothing to resume.`);
-      if (this.designChanged(runId)) {
-        this.stopRun(runId, State.PAUSED, DESIGN_CHANGED);
-        throw new Error(`${DESIGN_CHANGED} Review the edited design, then 'qfb approve ${runId}'.`);
-      }
-      // The operator vouches for files the confidentiality scan could not read:
-      // exactly the content the gate saw (path + digest), nothing later.
-      const vetted = opts.acceptUnscannable ? this.unscannableList(runId, UNSCANNABLE_PENDING) : [];
-      if (opts.acceptUnscannable && vetted.length === 0) {
-        throw new Error(`Run ${runId} has no unscannable files awaiting a decision.`);
-      }
-      const open = this.store.openSessions(runId);
-      for (const s of open) {
-        if (await this.pi.isRunning(ref(s))) {
-          throw new Error(
-            `Session ${s.sessionId} (pid ${s.pid} on ${s.host}) is still running; wait for it to exit or 'qfb stop ${runId}' first.`,
-          );
-        }
-      }
-      const git = this.makeGit(run.repoPath);
-      const evidence = open.map((s) => this.preserveInterrupted(run, git, s));
-      const target = this.resumeStateOf(runId);
-      const retry = run.state === State.FAILED;
-      this.store.tx(() => {
-        for (const s of open) this.retireSession(s.rowId, "interrupted");
-        this.reopenSteps(runId);
-        if (retry) {
-          this.store.setNumber(runId, BUDGET_EPOCH, this.store.maxSessionRowId(runId));
-          this.store.deleteCounter(runId, "finding-identity-history");
-          this.store.deleteCounter(runId, "bug-identity-history");
-        }
-        this.store.deleteCounter(runId, PAUSE_REQUEST);
-        this.store.deleteCounter(runId, STOP_REQUEST);
-        if (vetted.length > 0) {
-          const accepted = this.unscannableList(runId, UNSCANNABLE_ACCEPTED);
-          this.store.setCounter(runId, UNSCANNABLE_ACCEPTED, JSON.stringify([...accepted, ...vetted]));
-          this.store.deleteCounter(runId, UNSCANNABLE_PENDING);
-        }
-        this.store.setStopReason(runId, null);
-        this.transition(runId, run.state, target, retry ? "operator-retry" : "operator-resume",
-          JSON.stringify({
-            previousStopReason: run.stopReason,
-            evidence,
-            ...(vetted.length > 0 ? { vettedUnscannable: vetted } : {}),
-          }));
+      if (!isOrthogonal(run.state)) throw new Error(`Run ${runId} is ${run.state}; the design is revised while the run is stopped.`);
+      const missing = this.designMissing(run);
+      if (missing) throw new Error(missing);
+      await this.assertNoLiveSession(runId);
+      const git = this.gitFor(run);
+      const n = this.store.countSessions(runId, { kind: "design-revision" }) + 1;
+      const stepId = `design-${n}`;
+      const artifactPath = this.artifactPath(runId, `design-revision-${n}.json`);
+      const draftPath = `${artifactPath}.design.md`;
+      const designHash = sha256(readFileSync(run.designPath, "utf8"));
+      const got = await this.launchSession(run, git, {
+        kind: "design-revision",
+        stepId,
+        sessionId: `${runId}-design-${n}`,
+        artifactPath,
+        label: { feature: runId, phase: "DESIGN", stepId },
+        prompt: this.buildDesignRevisionPrompt(run, o, stepId, draftPath, artifactPath),
       });
-      return target;
+      this.store.consumeSession(got.row.rowId);
+      this.inflight = null;
+      const a = got.result.artifact;
+      const gate = mechanicalGate({
+        mode: "read-only",
+        artifact: a,
+        artifactProblem: got.problem,
+        sessionCompleted: got.result.settled && !got.result.timedOut,
+        before: got.before,
+        after: git.snapshot(run.baseRef),
+        expectedBranch: run.branch,
+        allowedPathPrefixes: [],
+        denyList: run.denyList,
+        changedFiles: [],
+        added: NO_CONTENT,
+        verifiedTests: [],
+      });
+      const problems = [...gate.failures];
+      if (sha256(readFileSync(run.designPath, "utf8")) !== designHash) {
+        problems.push(`The agent edited ${run.designPath} in place instead of writing a draft; check it and undo unwanted changes.`);
+      }
+      if (a && a.status !== AgentStatus.DONE) problems.push(`The agent did not draft a revision (${a.status}): ${a.summary}`);
+      if (!existsSync(draftPath) || !readFileSync(draftPath, "utf8").trim()) problems.push(`No draft was written to ${draftPath}.`);
+      return { draftPath, summary: a?.summary ?? "", problem: problems.length > 0 ? problems.join(" ") : null };
     } finally {
-      this.store.releaseLock(runId);
+      this.inflight = null;
+      this.store.releaseLock(keys);
     }
+  }
+
+  /**
+   * For a run stopped by a gate: which of the problems a person had to fix
+   * are still visible in the checkout. Empty when all look resolved.
+   */
+  recheck(runId: string): string[] {
+    const run = this.requireRun(runId);
+    const b = this.blocker(runId);
+    if (b?.kind !== "gate") return [];
+    const git = this.gitFor(run);
+    const changed = new Set(git.changedFiles(run.baseRef));
+    const left: string[] = [];
+    for (const p of b.problems) {
+      switch (p.code) {
+        case "orchestration-doc":
+        case "out-of-scope":
+          for (const f of p.files ?? []) if (changed.has(f)) left.push(`${f} is still in the change set.`);
+          break;
+        case "deny-term":
+          if (!left.some((l) => l.startsWith("Confidentiality"))) {
+            const leaks = confidentialityProblems(this.writerEvidence(run, git).added, run.denyList).filter((x) => x.code === "deny-term");
+            left.push(...leaks.map((x) => x.message));
+          }
+          break;
+        case "branch-changed":
+          if (git.branch() !== run.branch) left.push(`The checkout is on '${git.branch()}', not '${run.branch}'.`);
+          break;
+        case "head-moved":
+          if (p.actual && git.head() === p.actual) left.push(`HEAD is still the agent's commit ${p.actual.slice(0, 12)}.`);
+          break;
+        case "submodule-moved":
+          if (git.snapshot(run.baseRef).submoduleHead !== p.expected) {
+            left.push(`The java-questdb-client submodule is not back at ${p.expected?.slice(0, 12) ?? "its earlier state"}.`);
+          }
+          break;
+        case "read-only-modified":
+          if (git.snapshot(run.baseRef).dirtyFingerprint !== p.expected) left.push("The checkout still differs from before the read-only session.");
+          break;
+        default:
+          break; // A fresh attempt may fix it; nothing for a person to check.
+      }
+    }
+    return left;
+  }
+
+  /** How `qfb build` was asked to finish this run, so `qfb continue` finishes it the same way. */
+  setBuildOptions(runId: string, o: BuildOptions): void {
+    this.requireRun(runId);
+    this.store.setCounter(runId, BUILD_OPTIONS, JSON.stringify(o));
+  }
+
+  buildOptions(runId: string): BuildOptions | null {
+    const v = this.store.getCounter(runId, BUILD_OPTIONS);
+    return v ? (JSON.parse(v) as BuildOptions) : null;
+  }
+
+  /** Git for the run's checkout as its gates see it (local docs excluded); for the PR step. */
+  gitForRun(runId: string): GitLike {
+    return this.gitFor(this.requireRun(runId));
+  }
+
+  private approvedCopyPath(runId: string): string {
+    return join(this.artifactRoot, runId, "approved-design.md");
+  }
+
+  /** Keep the approved design's text, so a later edit can be shown as a diff. */
+  private keepApprovedCopy(runId: string, text: string): void {
+    writeFileSync(this.artifactPath(runId, "approved-design.md"), text);
   }
 
   // ---------------------------------------------------------------- clean
@@ -1194,6 +1659,10 @@ export class Controller {
       resumeTo: isOrthogonal(run.state) ? this.resumeStateOf(runId) : null,
       pendingRequests: requests.map((k) => k.replace("request-", "")),
       unscannablePending: this.unscannableList(runId, UNSCANNABLE_PENDING).map((f) => f.path),
+      designPath: run.designPath,
+      localDocs: this.localDocs(runId),
+      blocker: this.blocker(runId),
+      decisions: this.store.getDecisions(runId),
       preparedPlanPath: this.store.getCounter(runId, "prepared-plan-path"),
       planStrategy: this.store.getCounter(runId, "plan-strategy"),
       planAmbiguous: this.store.getCounter(runId, PLAN_AMBIGUOUS) !== null,
@@ -1275,7 +1744,7 @@ export class Controller {
     return {
       row,
       problem,
-      before: row.gitBefore ?? this.makeGit(run.repoPath).snapshot(run.baseRef),
+      before: row.gitBefore ?? this.gitFor(run).snapshot(run.baseRef),
       result: {
         sessionId: row.sessionId,
         settled: row.exitCode !== null,
@@ -1368,7 +1837,8 @@ export class Controller {
     this.stopRun(runId, State.PAUSED,
       `${what}: ${files.length} changed file(s) cannot be scanned for deny-listed terms: ` +
         `${files.map((f) => `${f.path} (${f.reason})`).join(", ")}. Check them by hand; if they are clean, ` +
-        `'qfb resume ${runId} --accept-unscannable'; otherwise remove them and 'qfb resume ${runId}'.`);
+        `'qfb resume ${runId} --accept-unscannable'; otherwise remove them and 'qfb resume ${runId}'.`,
+      { kind: "unscannable", files });
   }
 
   /**
@@ -1399,12 +1869,12 @@ export class Controller {
         const msg =
           `Session ${s.sessionId} (pid ${s.pid} on ${s.host}) from an earlier controller is still running; ` +
           `refusing to start a second writer. Let it finish (or 'qfb stop ${runId}'), then 'qfb resume ${runId}'.`;
-        this.stopRun(runId, State.RECONCILIATION, msg);
+        this.stopRun(runId, State.RECONCILIATION, msg, { kind: "session-running", sessionId: s.sessionId, pid: s.pid, host: s.host });
         throw new HaltSignal(msg);
       }
     }
     const run = this.requireRun(runId);
-    const git = this.makeGit(run.repoPath);
+    const git = this.gitFor(run);
     const evidence = open.map((s) => this.preserveInterrupted(run, git, s));
     this.store.tx(() => {
       for (const s of open) this.retireSession(s.rowId, "interrupted");
@@ -1421,14 +1891,15 @@ export class Controller {
   private haltForStop(runId: string, rowId: number | null): never {
     const run = this.requireRun(runId);
     const s = rowId !== null ? this.store.getSession(rowId) : null;
-    const evidence = s ? this.preserveInterrupted(run, this.makeGit(run.repoPath), s) : null;
+    const evidence = s ? this.preserveInterrupted(run, this.gitFor(run), s) : null;
     this.store.tx(() => {
       if (s) this.store.consumeSession(s.rowId);
       this.inflight = null;
       this.store.deleteCounter(runId, STOP_REQUEST);
       this.stopRun(runId, State.RECONCILIATION,
         `Operator forced stop${s ? ` during session ${s.sessionId}; partial changes preserved at ${evidence}` : ""}. ` +
-          `Inspect the checkout, then 'qfb resume ${runId}'.`);
+          `Inspect the checkout, then 'qfb resume ${runId}'.`,
+        { kind: "interrupted", evidence: evidence ? [evidence] : [] });
     });
     throw new HaltSignal("stopped");
   }
@@ -1524,10 +1995,11 @@ export class Controller {
     return State.READY;
   }
 
-  private stopRun(runId: string, state: StateName, reason: string): StateName {
+  private stopRun(runId: string, state: StateName, reason: string, blocker: Blocker): StateName {
     this.store.tx(() => {
       const run = this.requireRun(runId);
       this.store.setStopReason(runId, reason);
+      this.store.setCounter(runId, BLOCKER, JSON.stringify(blocker));
       if (state === State.PAUSED) this.store.deleteCounter(runId, PAUSE_REQUEST);
       if (run.state !== state) this.transition(runId, run.state, state, "stop", reason);
       if (this.inflight !== null) {
@@ -1536,6 +2008,17 @@ export class Controller {
       }
     });
     return state;
+  }
+
+  /** Git for the run's checkout, blind to the docs that are not part of the feature. */
+  private gitFor(run: RunRow): GitLike {
+    return this.makeGit(run.repoPath, { exclude: this.localDocs(run.id) });
+  }
+
+  /** Why the design cannot be read, or null when it can. A run never proceeds without its design. */
+  private designMissing(run: RunRow): string | null {
+    if (existsSync(run.designPath)) return null;
+    return `The design document ${run.designPath} is missing; restore it, or point the run at its new location.`;
   }
 
   private designChanged(runId: string): boolean {
@@ -1560,6 +2043,7 @@ export class Controller {
         this.store.consumeSession(this.inflight);
         this.inflight = null;
       }
+      if (isOrthogonal(from) && !isOrthogonal(to)) this.store.deleteCounter(runId, BLOCKER);
       this.store.recordTransition(runId, from, to, op, evidence);
     });
   }
@@ -1568,6 +2052,15 @@ export class Controller {
     if (!this.store.acquireLock(runId)) throw new Error(this.lockedMessage(runId));
     try {
       return fn();
+    } finally {
+      this.store.releaseLock(runId);
+    }
+  }
+
+  private async withRunLockAsync<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    if (!this.store.acquireLock(runId)) throw new Error(this.lockedMessage(runId));
+    try {
+      return await fn();
     } finally {
       this.store.releaseLock(runId);
     }
@@ -1592,6 +2085,44 @@ export class Controller {
 
   private artifactPath(runId: string, name: string): string {
     return join(this.artifactDir(runId), name);
+  }
+
+  /** Where agents keep notes and drafts: outside the checkout, removed with the run. */
+  private scratchDir(runId: string): string {
+    const dir = join(this.artifactDir(runId), "scratch");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  /** Rules for every session that works in the checkout. */
+  private rules(run: RunRow): string[] {
+    return [
+      ...Controller.COMMON_RULES,
+      `- Keep notes, analyses and drafts in ${this.scratchDir(run.id)}; never write them into the checkout.`,
+      `- If you cannot proceed without a human choice (the design is wrong, ambiguous, or contradicts the code), do not`,
+      `  guess: set status NEEDS_DECISION and fill decision: {question, options[], recommended (0-based index), context}.`,
+      `  QFB shows it to the operator and gives you the answer.`,
+    ];
+  }
+
+  /** The operator's decisions so far, for every prompt: they settle what the design left open or got wrong. */
+  private decisionLines(runId: string, forReview = false): string[] {
+    const ds = this.store.getDecisions(runId);
+    if (ds.length === 0) return [];
+    const indent = (t: string) => t.trim().split("\n").join("\n     ");
+    return [
+      forReview
+        ? `Operator decisions already settled for this feature (do not raise findings that contradict them):`
+        : `Operator decisions (binding; where they conflict with the design, they win):`,
+      ...ds.map((d, i) =>
+        [
+          `- D${i + 1} (${d.stepId}${d.designRevised ? "; the design was revised to match" : ""})`,
+          `  Q: ${indent(d.question)}`,
+          `  A: ${indent(d.answer)}`,
+        ].join("\n"),
+      ),
+      ``,
+    ];
   }
 
   private priorFailures(runId: string, key: string): string[] {
@@ -1630,6 +2161,7 @@ export class Controller {
       `## Assigned step ${step.id}`,
       step.text,
       ``,
+      ...this.decisionLines(run.id),
       ...(attempt > 1
         ? [
             `This is attempt ${attempt}. The working tree may contain partial changes from an earlier, interrupted or`,
@@ -1641,10 +2173,10 @@ export class Controller {
       `Rules:`,
       `- Implement ONLY this step and its tests. Do NOT start another step.`,
       `- Do NOT change the architecture, requirements, or other plan steps.`,
-      ...Controller.COMMON_RULES,
+      ...this.rules(run),
       `- When done, write a typed JSON TaskArtifact to: ${artifactPath}`,
       `  with fields: {runId, stepId, kind, status, summary, changedFiles[],`,
-      `  testCommands[{command,exitCode}], limitations[], notableDecisions[], createdAt}.`,
+      `  testCommands[{command,exitCode}], limitations[], notableDecisions[], decision?, createdAt}.`,
       ...Controller.identity(run.id, step.id, "implementation"),
       `- status MUST be one of DONE | BLOCKED | NEEDS_DECISION | FAILED.`,
     ].join("\n");
@@ -1680,11 +2212,12 @@ export class Controller {
       `Read CLAUDE.md and the approved design at: ${run.designPath}`,
       ...what,
       ...(prior.length ? [`The previous attempt was rejected by QFB's mechanical gate: ${prior.join("; ")}`] : []),
+      ...this.decisionLines(run.id),
       `Rules:`,
-      ...Controller.COMMON_RULES,
+      ...this.rules(run),
       `Write a typed JSON TaskArtifact to ${artifactPath} with status DONE | BLOCKED | NEEDS_DECISION | FAILED`,
       `and fields {runId, stepId, kind, status, summary, changedFiles[], testCommands[{command,exitCode}], limitations[],`,
-      `notableDecisions[], bugs[], handoffPath, createdAt}.`,
+      `notableDecisions[], bugs[], handoffPath, decision?, createdAt}.`,
       ...Controller.identity(run.id, stepId, stage === State.HARDENING_IDENTIFY ? "coverage-gap" : "bug"),
     ].join("\n");
   }
@@ -1694,6 +2227,7 @@ export class Controller {
       `Run QuestDB's review-pr skill on the cumulative feature diff.`,
       `Invoke: /skill:review-pr --range=${run.baseRef}.. --level=${run.config.reviewLevel}`,
       `This session is READ-ONLY: do NOT modify any file in the checkout (QFB verifies the tree is unchanged).`,
+      ...this.decisionLines(run.id, true),
       `Write the COMPLETE raw report to ${artifactPath}.report.md and set reviewReportPath to that path.`,
       `The report MUST contain exactly ONE machine-readable fenced \`\`\`qfb-review JSON block (never quote or`,
       `repeat it) with {verdict, testGatePassed, findings:[{id,severity,location,evidence}]}; finding ids must be unique.`,
@@ -1702,17 +2236,101 @@ export class Controller {
     ].join("\n");
   }
 
+  private buildDesignRevisionPrompt(
+    run: RunRow,
+    o: { question: string; answer: string },
+    stepId: string,
+    draftPath: string,
+    artifactPath: string,
+  ): string {
+    return [
+      `Revise a feature design document to match a decision the operator just made.`,
+      `Design document: ${run.designPath}`,
+      `Read it, CLAUDE.md, and whatever code you need to understand the decision.`,
+      ``,
+      `Question raised while implementing it:`,
+      o.question,
+      ``,
+      `The operator's decision:`,
+      o.answer,
+      ``,
+      ...this.decisionLines(run.id),
+      `Write the COMPLETE revised document to: ${draftPath}`,
+      `- Change only what the decision requires; keep everything else verbatim (wording, headings, order, formatting).`,
+      `- Where the decision changes what an Implementation Plan step must do, edit that step. Add or remove steps only`,
+      `  when the decision requires it, and keep the plan's numbering and format.`,
+      `- Do NOT modify the design document itself or any file in the checkout: this session is READ-ONLY (QFB verifies`,
+      `  both are unchanged). The operator reviews the draft as a diff before it replaces the design.`,
+      `Write a typed JSON TaskArtifact to ${artifactPath} with status DONE (BLOCKED if the decision cannot be reconciled`,
+      `with the design), summary = what you changed and why, and empty testCommands.`,
+      ...Controller.identity(run.id, stepId, "design"),
+    ].join("\n");
+  }
+
   private buildFixPrompt(run: RunRow, findings: unknown, artifactPath: string): string {
     return [
       `Run QuestDB's fix-pr skill against these authorized findings:`,
       JSON.stringify(findings, null, 2),
       `Preserve finding IDs, severities, context, and evidence.`,
+      ...this.decisionLines(run.id),
       `Rules:`,
-      ...Controller.COMMON_RULES,
+      ...this.rules(run),
       `Report the skill's distinct outcome in fixOutcome: Clean | Blocked | Diverging | Exhausted.`,
       `Write a typed JSON TaskArtifact (status DONE unless blocked) to ${artifactPath}.`,
       ...Controller.identity(run.id, "fix", "fix"),
     ].join("\n");
+  }
+}
+
+/** A `git diff --no-index` of two files, with readable labels instead of the file paths. */
+function labelDiff(diff: string, from: string, to: string): string {
+  const lines = diff.split("\n");
+  const at = lines.findIndex((l) => l.startsWith("--- "));
+  return at < 0 ? diff : [`--- ${from}`, `+++ ${to}`, ...lines.slice(at + 2)].join("\n");
+}
+
+/** The pause for a question an agent (or a stalled phase) cannot settle itself. */
+function decisionBlocker(
+  source: "agent" | "blocked",
+  stage: string,
+  stepId: string,
+  a: TaskArtifact | null,
+  evidencePath: string,
+): Blocker {
+  const d = a?.decision;
+  return {
+    kind: "decision",
+    source,
+    stage,
+    stepId,
+    question: d?.question ?? (a?.summary || "The agent stopped without saying what it needs; see its artifact and transcript."),
+    options: d?.options ?? [],
+    recommended: d?.recommended ?? null,
+    context: d?.context ?? "",
+    evidencePath,
+  };
+}
+
+/**
+ * Repository-relative paths that are not part of the feature: the design
+ * document when it lives inside the checkout, plus docs the operator keeps local.
+ */
+function localDocsOf(repoPath: string, designPath: string, extra: string[]): string[] {
+  const rel = relative(realOrResolved(repoPath), realOrResolved(designPath));
+  const inside = rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  return [...new Set([...(inside ? [rel] : []), ...extra])];
+}
+
+function realOrResolved(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    // Not there (yet): resolve what exists, so a missing file still maps into its checkout.
+    try {
+      return join(realpathSync(dirname(p)), basename(p));
+    } catch {
+      return resolve(p);
+    }
   }
 }
 

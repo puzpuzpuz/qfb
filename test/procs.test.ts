@@ -114,6 +114,37 @@ test("Git.commitAll commits the gated tree and is a no-op when nothing changed",
   assert.equal(git.isClean(), true);
 });
 
+test("Git exclude: local docs are invisible to gates and fingerprints, and never committed", () => {
+  const { dir, base } = repo();
+  // The design lives in the checkout under an awkward name; another doc is tracked and edited.
+  const design = "HANDOFF [lv]*.md";
+  writeFileSync(join(dir, "notes.md"), "v1\n");
+  execFileSync("git", ["add", "notes.md"], { cwd: dir });
+  execFileSync("git", ["commit", "-q", "-m", "notes"], { cwd: dir });
+  const git = new Git(dir, { exclude: [design, "notes.md"] });
+  const fp0 = git.snapshot(base).dirtyFingerprint;
+  writeFileSync(join(dir, design), "AcmeCorp design\n");
+  writeFileSync(join(dir, "notes.md"), "v2 AcmeCorp\n");
+  execFileSync("git", ["add", "notes.md"], { cwd: dir }); // the operator staged it themselves
+
+  assert.equal(git.isClean(), true);
+  assert.deepEqual(git.changedFiles(base), []);
+  assert.deepEqual(git.addedContent(base).files, []);
+  assert.equal(git.snapshot(base).dirtyFingerprint, fp0, "editing a local doc is not a checkout change");
+
+  writeFileSync(join(dir, "b.txt"), "feature\n");
+  assert.deepEqual(git.changedFiles(base), ["b.txt"]);
+  git.commitAll("[qfb] S1");
+  const committed = execFileSync("git", ["show", "--name-only", "--format=", "HEAD"], { cwd: dir, encoding: "utf8" });
+  assert.deepEqual(committed.trim().split("\n"), ["b.txt"]);
+  // Both docs keep their content in the working tree, uncommitted.
+  assert.equal(readFileSync(join(dir, design), "utf8"), "AcmeCorp design\n");
+  const status = execFileSync("git", ["status", "--porcelain"], { cwd: dir, encoding: "utf8" });
+  assert.match(status, /^ M notes\.md$/m);
+  assert.match(status, /^\?\? "HANDOFF \[lv\]\*\.md"$/m);
+  assert.equal(git.isClean(), true);
+});
+
 test("pushBlocker: only the exact reviewed commit, clean, on the run's branch, under commit policy", () => {
   const { dir, git, base } = repo();
   writeFileSync(join(dir, "b.txt"), "b\n");

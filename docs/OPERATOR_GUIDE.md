@@ -21,9 +21,9 @@ accepted, and refuses a PR title/body containing deny-listed terms.
 **It is interruptible and resumable.** `build` keys off `(repo, design, base)` and
 resumes the existing run from its persisted state. If it is interrupted
 (Ctrl-C, crash, reboot), **re-run the identical command** — it continues from
-where it stopped and never repeats verified work. If it pauses for a decision,
-stops on a budget/no-progress condition, or needs reconciliation, it prints the
-reason; fix the issue, run `qfb resume RUN_ID`, and re-run `build`.
+where it stopped and never repeats verified work. If it stops for you (a
+decision, a rejected change, a budget, reconciliation), it explains why and what
+to do; `qfb continue` (§6) resolves it with you and carries on.
 
 Without `--yes`, `build` shows the normalized manifest and prompts for approval
 interactively; on a non-TTY it stops at the approval gate and tells you to pass
@@ -69,6 +69,11 @@ as the same plan. Either approve the proposed mapping, or move the extra list ou
 
 See [`../examples/sample-design.md`](../examples/sample-design.md).
 
+The doc may live inside the checkout (say, `HANDOFF-feature.md` at its root). QFB keeps the run's
+design out of every gate, fingerprint, and checkpoint commit, so it never ends up in the change set
+or the PR. Don't commit it yourself either. If you move it, `qfb continue RUN_ID --design NEW_PATH`
+points the run at the new location; a run never proceeds while its design is missing.
+
 ## 2. Initialize
 
 ```bash
@@ -107,8 +112,9 @@ qfb approve run-xxxxxxxx    # freezes the design hash + plan manifest
 
 Approval is explicit and authoritative. A plan with no extractable steps is never approved. If you
 edit the design **after** approval, QFB detects the hash change on the next `run`/`resume`, enters
-`paused`, and requires a fresh `approve` (re-approval) before any implementation/hardening/review
-work may proceed.
+`paused`, and requires re-approval before any implementation/hardening/review work may proceed.
+`qfb continue` does that in one step: it shows the design diff against the approved version and the
+resulting plan diff, and approves exactly what you saw.
 
 `approve` always approves the design as it is on disk, together with the steps extracted from
 that exact text. If the design changed since the plan was prepared and its steps changed, `approve`
@@ -165,15 +171,38 @@ can watch live. Remember: a pane going idle is **not** proof of completion.
 - `qfb stop RUN_ID` — forced stop: terminates the active session's whole process tree (Pi and any
   Maven/JVM it started), saves the working-tree state to `*.interrupted.patch`, and puts the run in
   `reconciliation`. The changes themselves stay in the checkout.
-- `qfb resume RUN_ID` — reconcile and continue: re-checks design integrity, refuses while any
+- `qfb continue [RUN_ID]` — the usual way back: explains the stop, helps you resolve it (below),
+  then drives the run to completion and opens the PR `build` asked for. Without a terminal it
+  never asks: it resumes when nothing is needed from you, takes answers from options, and stops at
+  the next point that needs you (exit code 2).
+- `qfb resume RUN_ID` — the lower-level step: reconcile and continue: re-checks design integrity, refuses while any
   earlier session is still running, and returns the run to the phase it was interrupted in (shown
   as `resumeTo` in `qfb status`). Resuming a **failed** run is an explicit operator retry: failed
   steps are re-opened and the attempt/iteration/session budgets start a fresh window (recorded as an
   `operator-retry` transition). Restarting a controller never resets a budget by itself.
 
-When paused for a decision, `status` shows the `stopReason`. Inspect and, if needed, modify the
-checkout yourself, then `resume`. QFB never auto-approves permission dialogs, broad scope increases,
-or destructive Git actions.
+`qfb status RUN_ID` shows why a run stopped and what to do, with concrete commands. QFB never
+auto-approves permission dialogs, broad scope increases, or destructive Git actions.
+
+**Questions and design flaws.** Agents are told not to guess when the design is wrong, ambiguous,
+or contradicts the code: they stop with a question, options, and a recommendation (a `blocked`
+agent, a review that needs discussion, or a review QFB cannot remediate stop the same way).
+`qfb continue` shows it; pick an option or type your answer (`--option N` / `--answer "..."`
+without a terminal). The answer is recorded and given to every later session, including the review,
+which will not raise findings against a settled decision. When the answer changes the spec, accept
+the offer to update the design: an agent drafts the change in a read-only session (it may not touch
+the checkout or the design itself), and you see the design diff and the plan diff. Apply it, edit
+the draft first, keep your answer without changing the design, or stop. Only the exact draft you
+approved replaces the design (the previous version is kept in the run's artifacts). Finished steps
+keep their status; changed steps run next. You can also edit the design yourself at any point;
+`continue` then approves your edit and records it as the answer to the pending question.
+
+**Rejected changes.** A gate stop lists each problem: those only you can fix (a note an agent left
+in the checkout, a commit an agent made, a deny-listed term, a branch switch) with the command that
+fixes them, and those a fresh attempt fixes (no tests ran, a test failed), which need nothing from
+you. `continue` re-checks your fixes before it resumes. A document that is yours rather than an
+agent's can stay where it is: `qfb continue RUN_ID --keep-local PATH` (or `k` at the prompt) keeps it
+out of gates and commits, like the design. Agents keep their own notes in `artifacts/<run-id>/scratch/`.
 
 **Files the confidentiality scan cannot read.** A changed file that is binary, larger than 64 MiB,
 or unreadable cannot be checked against the deny-list, so the gate fails closed: the run pauses and
@@ -188,13 +217,13 @@ the cause and `resume`; the interrupted session's result is re-checked, not redo
 
 ## 7. Recovery after a crash
 
-Just run `qfb run RUN_ID` (or re-run `build`). The controller re-acquires the lock, re-reads
+Just run `qfb continue RUN_ID` (or `qfb run RUN_ID`, or re-run `build`). The controller re-acquires the lock, re-reads
 durable state, and checks every session the previous controller never saw end, using the pid it
 recorded:
 
 - **Still running** (e.g. the controller was `kill -9`ed but Pi lives on): the run enters
   `reconciliation` and no second writer is started. Let it finish or `qfb stop` it, then
-  `qfb resume`.
+  `qfb continue` (which offers to stop it for you).
 - **Gone**: its partial work is preserved (`*.interrupted.patch`) and left in the working tree, the
   session is retired, and the phase continues with a fresh attempt that is told to build on those
   changes rather than start over.
@@ -208,11 +237,11 @@ QFB terminates the session it launched before exiting. Retry budgets persist acr
 - Review returned **needs-discussion** → paused for your decision.
 - `fix-pr` returned **Blocked / Diverging / Exhausted**, or claimed *Clean* but its tests fail when
   QFB re-runs them → failed (only a verified *Clean* advances).
-- A **stale** review result (the checkout changed during review) → paused; `qfb resume` reviews again.
+- A **stale** review result (the checkout changed during review) → paused; `qfb continue` reviews again.
 - The **final regression run** failed on the reviewed candidate → paused with the failing commands
-  and logs (if a command is obsolete, remove it from `regression-suite.json`), then `qfb resume`.
+  and logs (if a command is obsolete, remove it from `regression-suite.json`), then `qfb continue`.
 - The **review iteration limit**, a **hardening budget**, or the **hard session ceiling** was
-  reached → failed; `qfb resume` grants an audited retry.
+  reached → failed; `qfb continue` grants an audited retry, optionally with guidance for the agent.
 - The **same blocker/bug identity** survived remediation without progress → failed, evidence preserved.
 - A **scope/integrity/confidentiality** violation (out-of-scope file, deny-listed name, orchestration
   artifact, HEAD/branch/submodule moved, a read-only stage that modified the tree) → paused. The

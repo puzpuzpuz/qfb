@@ -31,6 +31,8 @@ Node process; there is no server, broker, or scheduler.
 | File | Responsibility |
 |------|----------------|
 | `src/controller.ts` | The durable controller. Owns the lifecycle, runs `advance()` as a pure function of persisted state, gates every session, re-runs claimed validation commands, checkpoints, drives the hardening and review/fix loops, and handles pause/resume/stop/reconciliation. |
+| `src/drive.ts` | `qfb continue` (and the tail of `build`): takes a run from wherever it is to completion. Explains each stop and resolves it with the operator (approve a plan or an edited design, answer a question, optionally via an agent-drafted design revision approved as a diff, re-check a gate fix, vet files, retry). I/O is injected, so every flow is tested with scripted answers. |
+| `src/explain.ts` | Pure: turns a run's typed `Blocker` (why it stopped) into a title, the facts, and concrete, copy-pasteable actions; renders `qfb status`. |
 | `src/stateMachine.ts` | The validated transition table. Invalid transitions throw. Orthogonal states (`paused`/`blocked`/`failed`/`reconciliation`) are reachable from any non-terminal state and exit back to the interrupted phase (`resumeTarget`). |
 | `src/store.ts` | `node:sqlite` transactional store: runs, steps, transitions, sessions (pid, outcome, consumption), checkpoints, reviews, counters, and atomic **exclusive locks** on the run and its checkout (pid+host, stale-takeover). |
 | `src/procs.ts` | Process groups: every Pi session and re-run test command leads its own group, so a timeout/stop kills the whole tree and strays are reaped on exit (no overlapping writers, no concurrent Maven). Also the default `sh -c` test runner. |
@@ -39,7 +41,7 @@ Node process; there is no server, broker, or scheduler.
 | `src/confidentiality.ts` | Frozen deny-list matching: both sides folded to lowercase letters and digits, then substring-matched, so case, separators, accents, and identifier embedding (`testTradeEventsOoo`) never hide a term. A mechanical gate, never an inference. |
 | `src/report.ts` | Parses `review-pr`'s machine-readable ```qfb-review``` surface (exactly one block, unique finding IDs); **pauses on ambiguity** instead of guessing. Selects actionable findings by policy; computes acceptance. |
 | `src/identity.ts` | One shared identity + no-progress mechanism, instantiated over review findings and hardening bug entries. |
-| `src/git.ts` | Read-mostly Git wrapper. Snapshots branch/HEAD/dirty-fingerprint/submodule/untracked; derives changed files and the content a change adds (for the confidentiality scan). Output is independent of user Git config, unbounded by buffer size in practice (1 GiB), and every failure throws `GitError`, which pauses the run: no fallback comparison is ever substituted. Checkpoint-commit only. **No destructive commands exist in the code.** |
+| `src/git.ts` | Read-mostly Git wrapper. Snapshots branch/HEAD/dirty-fingerprint/submodule/untracked; derives changed files and the content a change adds (for the confidentiality scan). Output is independent of user Git config, unbounded by buffer size in practice (1 GiB), and every failure throws `GitError`, which pauses the run: no fallback comparison is ever substituted. Checkpoint-commit only. **No destructive commands exist in the code.** Paths that are not part of the feature (the run's design when it lives in the checkout, docs kept local) are excluded from every listing, diff, fingerprint and commit. |
 | `src/adapters/pi.ts` | `PiAdapter` interface + `RpcPiAdapter`. Launches a fresh session, returns structured lifecycle info and the **typed artifact** — the only trusted completion signal. Pi's session files go to `--session-dir artifacts/<run-id>/pi-sessions`, so everything a run produces lives under its artifact dir (and `qfb clean` removes it). |
 | `src/adapters/herdr.ts` | `HerdrAdapter` interface + `CliHerdrAdapter`/`NullHerdrAdapter`. Pane labels, observation (never trusted as completion), output collection. |
 | `src/doctor.ts` | Preflight checks (Pi/Herdr/git/sqlite/skills/execution mode). |
@@ -75,6 +77,14 @@ recoverable:
 - **Budgets persist.** Attempt/iteration/session budgets count session rows, so restarts never reset
   them. Only an explicit operator retry of a `failed` run (`qfb resume`) opens a fresh, audited
   budget window.
+- **Stops explain themselves.** Every entry into `paused`/`blocked`/`failed`/`reconciliation`
+  stores a typed `Blocker` (gate problems carry codes and the refs/files to check); leaving the
+  state clears it. Operator decisions live in their own table, are written in the same transaction
+  as the resume they cause, and are rendered into every later prompt.
+- **Design revisions are drafts.** An agent revising the design runs read-only (the checkout's
+  fingerprint and the design's hash must be unchanged) and writes a draft to the run's artifacts.
+  The operator approves the draft by content hash; only then is it written over the design,
+  re-planned and approved, in the transaction that resumes the run.
 
 ## Why these technology choices
 

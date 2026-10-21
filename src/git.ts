@@ -43,8 +43,21 @@ export class GitError extends Error {
  */
 export class Git {
   private readonly cwd: string;
-  constructor(cwd: string) {
+  private readonly exclude: string[];
+  /**
+   * `exclude`: repository-relative paths that are not part of the feature (the
+   * run's design document, docs the operator keeps local). They are invisible
+   * to every listing, diff and fingerprint here, and never committed.
+   */
+  constructor(cwd: string, opts: { exclude?: string[] } = {}) {
     this.cwd = cwd;
+    this.exclude = opts.exclude ?? [];
+  }
+
+  /** Pathspec for the whole repository minus the excluded paths (none when nothing is excluded). */
+  private scope(): string[] {
+    if (this.exclude.length === 0) return [];
+    return ["--", ":/", ...this.exclude.map((p) => `:(exclude,literal)${p}`)];
   }
 
   /** Raw stdout of a git command. */
@@ -81,7 +94,7 @@ export class Git {
   }
 
   isClean(): boolean {
-    return this.run(["status", "--porcelain", "--untracked-files=normal"]).length === 0;
+    return this.run(["status", "--porcelain", "--untracked-files=normal", ...this.scope()]).length === 0;
   }
 
   /** Merge-base of HEAD and the given ref; used to anchor the feature base. */
@@ -107,7 +120,7 @@ export class Git {
   }
 
   untrackedFiles(): string[] {
-    return this.list(["ls-files", "-z", "--others", "--exclude-standard"]);
+    return this.list(["ls-files", "-z", "--others", "--exclude-standard", ...this.scope()]);
   }
 
   submoduleHead(path = "java-questdb-client"): string | null {
@@ -129,7 +142,7 @@ export class Git {
    */
   private dirtyFingerprint(base: string): string {
     const h = createHash("sha256");
-    h.update(this.exec(["diff", "--binary", ...PLAIN_DIFF, base]));
+    h.update(this.exec(["diff", "--binary", ...PLAIN_DIFF, base, ...this.scope()]));
     h.update("\0--untracked--\0");
     for (const f of this.untrackedFiles().sort()) {
       // Hash untracked file CONTENT (not just names) so an edit to an untracked
@@ -156,7 +169,7 @@ export class Git {
    * mechanical gate for scope checks instead of the agent's self-report.
    */
   changedFiles(base: string): string[] {
-    const tracked = this.list(["diff", "--name-only", "-z", ...PLAIN_DIFF, base]);
+    const tracked = this.list(["diff", "--name-only", "-z", ...PLAIN_DIFF, base, ...this.scope()]);
     return [...new Set([...tracked, ...this.untrackedFiles()])];
   }
 
@@ -172,7 +185,7 @@ export class Git {
     const unscannable: UnscannableFile[] = [];
 
     // Added/modified tracked paths (deletions excluded); "-" counts mark binary files.
-    for (const rec of this.list(["diff", "--numstat", "-z", "--diff-filter=d", ...PLAIN_DIFF, base])) {
+    for (const rec of this.list(["diff", "--numstat", "-z", "--diff-filter=d", ...PLAIN_DIFF, base, ...this.scope()])) {
       const m = /^(-|\d+)\t(-|\d+)\t([\s\S]*)$/.exec(rec);
       if (!m) throw new GitError(["diff", "--numstat"], `unexpected output record ${JSON.stringify(rec.slice(0, 80))}`);
       const path = m[3]!;
@@ -183,7 +196,7 @@ export class Git {
     // Added lines of the text diffs (-U0: no context lines).
     let current: string[] | null = null;
     let inHunk = false;
-    for (const line of this.exec(["diff", "-U0", "--diff-filter=d", ...PLAIN_DIFF, base]).split("\n")) {
+    for (const line of this.exec(["diff", "-U0", "--diff-filter=d", ...PLAIN_DIFF, base, ...this.scope()]).split("\n")) {
       if (line.startsWith("diff --git ")) {
         const path = diffHeaderPath(line);
         current = added.get(path) ?? null;
@@ -258,7 +271,7 @@ export class Git {
    * gates use changedFiles()/addedContent().
    */
   workingDiff(base: string): string {
-    const parts = [this.exec(["diff", ...PLAIN_DIFF, base])];
+    const parts = [this.exec(["diff", ...PLAIN_DIFF, base, ...this.scope()])];
     for (const f of this.untrackedFiles()) {
       const r = this.readUntracked(f);
       if (r === null) continue;
@@ -274,10 +287,17 @@ export class Git {
    * and the commit policy requires a clean checkout at init, so everything
    * staged here is gated feature work. A no-op when nothing changed (e.g. a
    * crash-replayed outcome that was already committed). We never push,
-   * rebase, or alter history.
+   * rebase, or alter history. Excluded paths are never committed, even when
+   * the operator staged them: they are unstaged, and the working tree is left
+   * as it is.
    */
   commitAll(message: string): string {
-    this.run(["add", "-A"]);
+    this.run(["add", "-A", ...this.scope()]);
+    if (this.exclude.length > 0) {
+      // Only what is staged: restore fails outright on a path the index does not know.
+      const staged = this.list(["diff", "--cached", "--name-only", "-z", "--", ...this.exclude.map((p) => `:(literal)${p}`)]);
+      if (staged.length > 0) this.run(["restore", "--staged", "--", ...staged.map((p) => `:(top,literal)${p}`)]);
+    }
     try {
       execFileSync("git", ["diff", "--cached", "--quiet"], { cwd: this.cwd, stdio: "ignore" });
       return this.head(); // exit 0: nothing staged
@@ -286,6 +306,22 @@ export class Git {
     }
     this.run(["commit", "-q", "-m", message]);
     return this.head();
+  }
+}
+
+/** Unified diff of two files (empty when identical), for showing a drafted document change. */
+export function diffFiles(before: string, after: string): string {
+  try {
+    execFileSync("git", ["diff", "--no-index", ...PLAIN_DIFF, "--", before, after], {
+      encoding: "utf8",
+      maxBuffer: GIT_MAX_BUFFER,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return ""; // exit 0: no differences
+  } catch (e) {
+    const err = e as Error & { status?: number; stdout?: string; stderr?: string };
+    if (err.status === 1 && typeof err.stdout === "string") return err.stdout;
+    throw new GitError(["diff", "--no-index"], (err.stderr || err.message).split("\n")[0] ?? "");
   }
 }
 

@@ -191,11 +191,22 @@ export interface AddedContent {
   unscannable: UnscannableFile[];
 }
 
+/** A question an agent cannot answer itself (status NEEDS_DECISION). */
+export interface DecisionRequest {
+  question: string;
+  /** Concrete alternatives, if the agent sees any. */
+  options: string[];
+  /** 0-based index into `options` of the agent's recommendation. */
+  recommended: number | null;
+  /** Why the choice matters: what in the design or code forces it. */
+  context: string;
+}
+
 /** Typed handoff artifact every session must emit on disk (Section 6). */
 export interface TaskArtifact {
   runId: string;
   stepId: string;
-  kind: "implementation" | "coverage-gap" | "bug" | "review" | "fix";
+  kind: "implementation" | "coverage-gap" | "bug" | "review" | "fix" | "design";
   status: AgentStatusName;
   summary: string;
   changedFiles: string[];
@@ -212,6 +223,80 @@ export interface TaskArtifact {
   bugs?: BugEntry[];
   /** Optional detailed handoff document (coverage-gap / bug report) outside the checkout. */
   handoffPath?: string;
+  /** With status NEEDS_DECISION: the question for the operator. */
+  decision?: DecisionRequest;
+}
+
+/** What a gate problem is about, so the CLI can explain it and check that it was fixed. */
+export type ProblemCode =
+  | "session-aborted"
+  | "no-artifact"
+  | "empty-summary"
+  | "no-tests"
+  | "tests-not-rerun"
+  | "claim-mismatch"
+  | "test-failed"
+  | "branch-changed"
+  | "head-moved"
+  | "submodule-moved"
+  | "read-only-modified"
+  | "orchestration-doc"
+  | "out-of-scope"
+  | "deny-term"
+  | "unscannable";
+
+export interface GateProblem {
+  code: ProblemCode;
+  message: string;
+  /** Only a person can resolve it (the run pauses); otherwise a fresh attempt may. */
+  human: boolean;
+  /** Paths concerned, for problems about specific files. */
+  files?: string[];
+  /** What it should be and what it was: branch, HEAD, submodule HEAD, or tree fingerprint. */
+  expected?: string | null;
+  actual?: string | null;
+  /** The deny-listed term, for `deny-term`. */
+  term?: string;
+}
+
+/** Why a run stopped, in a form the CLI can explain and help resolve. */
+export type Blocker =
+  | {
+      kind: "decision";
+      /** agent: NEEDS_DECISION; blocked: agent claimed BLOCKED; review: needs-discussion; remediation: review unfixable. */
+      source: "agent" | "blocked" | "review" | "remediation";
+      stage: string;
+      stepId: string;
+      question: string;
+      options: string[];
+      recommended: number | null;
+      context: string;
+      /** Where to read more: the session's artifact or the review report. */
+      evidencePath: string | null;
+    }
+  | { kind: "gate"; stage: string; stepId: string; problems: GateProblem[] }
+  | { kind: "unscannable"; files: UnscannableFile[] }
+  | { kind: "design-changed" }
+  | { kind: "design-missing"; path: string }
+  | { kind: "session-running"; sessionId: string; pid: number | null; host: string | null }
+  | { kind: "interrupted"; evidence: string[] }
+  | { kind: "operator-pause" }
+  | { kind: "git-error"; message: string }
+  | { kind: "review"; detail: string; reportPath: string | null }
+  | { kind: "stale"; detail: string }
+  | { kind: "regression"; failing: { command: string; exitCode: number; logPath: string }[]; suitePath: string }
+  | { kind: "budget"; detail: string; stepId: string | null };
+
+/** An operator's answer, recorded for the run and given to every later session. */
+export interface Decision {
+  id: number;
+  stage: string;
+  stepId: string;
+  question: string;
+  answer: string;
+  /** The design document was revised to match. */
+  designRevised: boolean;
+  createdAt: string;
 }
 
 export interface BugEntry {

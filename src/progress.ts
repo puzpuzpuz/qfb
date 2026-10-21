@@ -27,7 +27,7 @@ export function phaseGroup(state: string): string {
   return state.toLowerCase();
 }
 
-function stepMark(status: string, spin: string): string {
+export function stepMark(status: string, spin: string): string {
   switch (status) {
     case "done":
       return "\u2713"; // ✓
