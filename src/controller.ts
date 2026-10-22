@@ -184,6 +184,8 @@ const BUDGET_EPOCH = "budget-epoch";
 const ACCEPTED = "accepted-candidate";
 /** PRs (url + accepted head) the approving review was posted on. */
 const REVIEW_POSTED = "review-posted";
+/** Session row of a review whose unusable result is kept for one re-read on resume. */
+const HELD_REVIEW = "held-review";
 /** Hash of the design text the stored steps were extracted from. */
 const PLAN_SOURCE_HASH = "plan-source-hash";
 /** JSON notes explaining why the stored plan is ambiguous; absent when it is not. */
@@ -865,11 +867,45 @@ export class Controller {
   }
 
   // ------------------------------------------------- Phase D: review/fix
+  /**
+   * The review's result cannot be used. The first time, keep it and pause:
+   * resuming reads it again, so a report fixed by hand, or a QFB that now
+   * reads it, needs no new review. If it still cannot be used, drop it and
+   * review afresh (the operator already chose to continue).
+   */
+  private unusableReview(runId: string, rowId: number, held: boolean, reason: string, blocker: Blocker): void {
+    if (held) {
+      this.dropHeldReview(runId, rowId);
+      return;
+    }
+    this.store.tx(() => {
+      this.store.setCounter(runId, HELD_REVIEW, String(rowId));
+      this.holdOutcome(runId);
+      this.stopRun(runId, State.PAUSED, reason, blocker);
+    });
+  }
+
+  /** Drop a held review outcome; the next pass launches a fresh review. */
+  private dropHeldReview(runId: string, rowId: number): void {
+    this.store.tx(() => {
+      this.store.consumeSession(rowId);
+      this.store.deleteCounter(runId, HELD_REVIEW);
+    });
+    this.inflight = null;
+  }
+
   private async doReview(runId: string): Promise<void> {
     const run = this.requireRun(runId);
     const git = this.gitFor(run);
 
     let got = this.unconsumed(runId, "review", "review");
+    // A review held at a pause because its result could not be used is read
+    // again; a result about a checkout that has changed since is dropped.
+    const held = got !== null && this.store.getCounter(runId, HELD_REVIEW) === String(got.row.rowId);
+    if (got && held && !sameCandidate(got.before, git.snapshot(run.baseRef))) {
+      this.dropHeldReview(runId, got.row.rowId);
+      return;
+    }
     if (!got) {
       const used = this.sessionsSinceEpoch(runId, { kind: "review" });
       if (used >= run.config.maxReviewIterations) {
@@ -916,7 +952,7 @@ export class Controller {
     }
     if (!a!.reviewReportPath || !existsSync(a!.reviewReportPath)) {
       const detail = "Review session did not preserve a raw review-pr report.";
-      this.stopRun(runId, State.PAUSED, detail, { kind: "review", detail, reportPath: null });
+      this.unusableReview(runId, got.row.rowId, held, detail, { kind: "review", detail, reportPath: null });
       return;
     }
     const raw = await readFile(a!.reviewReportPath, "utf8");
@@ -926,12 +962,13 @@ export class Controller {
       report = parseReviewReport(raw);
     } catch (e) {
       if (e instanceof AmbiguousReportError) {
-        this.stopRun(runId, State.PAUSED, `Review report ambiguous — cannot extract verdict/findings: ${e.message}`,
+        this.unusableReview(runId, got.row.rowId, held, `Review report ambiguous — cannot extract verdict/findings: ${e.message}`,
           { kind: "review", detail: e.message, reportPath: a!.reviewReportPath! });
         return;
       }
       throw e;
     }
+    if (held) this.store.deleteCounter(runId, HELD_REVIEW);
     const iteration = this.store.getReviews(runId).length + 1;
     const record = () =>
       this.store.recordReview(runId, iteration, report.verdict, report.testGatePassed, a!.reviewReportPath!, candidate.dirtyFingerprint);
@@ -2413,6 +2450,11 @@ function realOrResolved(p: string): string {
 
 function ref(s: SessionRow): SessionRef {
   return { sessionId: s.sessionId, pid: s.pid, host: s.host };
+}
+
+/** Both snapshots show the same candidate: branch, commit, tree and submodule. */
+function sameCandidate(a: GitSnapshot, b: GitSnapshot): boolean {
+  return a.branch === b.branch && a.head === b.head && a.dirtyFingerprint === b.dirtyFingerprint && a.submoduleHead === b.submoduleHead;
 }
 
 /** Lock key for a checkout, so two runs can never write the same tree. */

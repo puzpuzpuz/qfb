@@ -200,6 +200,13 @@ async function resolveStop(d: Drive, opts: ContinueOptions): Promise<Outcome> {
       // Something in the checkout needs a person first; invoking continue without a terminal is the go-ahead.
       if (io.interactive && !(await yesNo(d, "\nDone? Continue now [Y/n] ", true))) return "stopped";
       break;
+    case "review":
+    case "stale":
+      // Resuming may start a fresh review, which is costly and fails the same
+      // way while the cause is unchanged: a person says when. Without a
+      // terminal, invoking continue is the go-ahead.
+      if (io.interactive && !(await yesNo(d, "\nContinue now? [Y/n] ", true))) return "stopped";
+      break;
     default:
       break;
   }

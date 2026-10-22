@@ -140,6 +140,9 @@ ID is optional) then resolves the stop in place and carries on to completion, PR
   `continue` re-checks that it is fixed before resuming. Problems a fresh attempt can fix (e.g.
   "no validation commands ran") are retried automatically.
 - **A budget ran out:** retry as is, or with guidance for the agent.
+- **The review's result could not be used** (no report, or no readable `qfb-review` block):
+  `continue` asks before going on, then reads the same result again (fix the report by hand if you
+  like), and runs a fresh review only if it still cannot be used or the checkout changed.
 
 Without a terminal, nothing is asked: `continue` resumes when no input is needed, takes answers from
 `--option N` / `--answer "..."` (`--accept-unscannable`, `--keep-local`, `--design` likewise), and

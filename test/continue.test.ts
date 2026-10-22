@@ -363,6 +363,37 @@ test("continue: a run that gave up is retried with the operator's guidance", asy
   assert.match(h.pi.launches[1]!.prompt, /A: Use the existing reader as a template/);
 });
 
+test("continue in a terminal: an unusable review result is retried only when you say so", async () => {
+  const prose: PiHandler = (req) => {
+    const p = `${req.artifactPath}.report.md`;
+    writeFileSync(p, 'R\n```qfb-review\n{"verdict":"looks fine","testGatePassed":true,"findings":[]}\n```\n');
+    return { artifact: artifact({ kind: "review", testCommands: [], reviewReportPath: p }) };
+  };
+  const h = makeHarness(THREE_STEP_DESIGN, [implDone("S1"), implDone("S2"), implDone("S3"), identify, writeTests, prose]);
+  const runId = start(h);
+  const reviews = () => h.pi.launches.filter((l) => l.stepId === "review").length;
+
+  // The build stops at the unusable review and asks; "n" leaves it there.
+  let op = scripted(["n"]);
+  assert.equal(await continueRun(h, runId, op.io).done, 2);
+  assert.match(op.text(), /The review result could not be used[\s\S]*Unrecognized verdict: "looks fine"/);
+  assert.match(op.text(), /fix its qfb-review block by hand/);
+  assert.match(op.text(), /Continue now\? \[Y\/n\]/);
+  assert.equal(reviews(), 1);
+  assert.equal(h.controller.status(runId).state, "paused");
+
+  // Each later failure asks again instead of reviewing until the budget is gone.
+  h.pi.push(prose);
+  h.pi.push(approved);
+  op = scripted(["", "y"]);
+  const c = continueRun(h, runId, op.io);
+  assert.equal(await c.done, 0);
+  assert.equal(op.left(), 0);
+  assert.equal(op.text().match(/Continue now\?/g)?.length, 2);
+  assert.equal(reviews(), 3);
+  assert.deepEqual(c.finished, [runId]);
+});
+
 test("explain: concrete, copy-pasteable fixes", () => {
   const f: RunFacts = { runId: "run-1", state: "paused", repoPath: "/w/my repo", designPath: "/w/d.md", stopReason: null };
   const why = explain(f, {

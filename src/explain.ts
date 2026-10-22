@@ -125,7 +125,12 @@ export function explain(run: RunFacts, b: Blocker | null): Explanation {
       return {
         title: "The review result could not be used",
         details: [b.detail, ...(b.reportPath ? [`Report: ${b.reportPath}`] : [])],
-        actions: [`Run a fresh review: ${cont}`],
+        actions: [
+          ...(b.reportPath
+            ? [`To keep this review instead of running another, fix its qfb-review block by hand (exactly one block; verdict approve, request changes or needs discussion)`]
+            : []),
+          `Continue: ${cont}  (reads the review's result again; only if it still cannot be used, or the checkout changed, a fresh review runs)`,
+        ],
       };
     case "stale":
       return {

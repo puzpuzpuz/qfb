@@ -456,23 +456,62 @@ test("state changes are compare-and-set: a concurrent change is refused, never o
 
 // ------------------------------------------------------------------ resume semantics
 
-test("resume after an ambiguous review launches a fresh review (no replay, no hardening re-run)", async () => {
-  const h = makeHarness(THREE_STEP_DESIGN, [
-    implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING,
-    (req) => {
-      const p = join(dirname(req.artifactPath), "bad.md");
+/** A review whose report has no qfb-review block; returns the handler and where the report lands. */
+function proseReview(): { handler: PiHandler; path: () => string } {
+  let p = "";
+  return {
+    handler: (req) => {
+      p = join(dirname(req.artifactPath), "bad.md");
       writeFileSync(p, "prose only");
       return { artifact: artifact({ kind: "review", testCommands: [], reviewReportPath: p }) };
     },
-  ]);
+    path: () => p,
+  };
+}
+
+test("resume after an ambiguous review reads it again, then reviews afresh (no replay, no hardening re-run)", async () => {
+  const bad = proseReview();
+  const h = makeHarness(THREE_STEP_DESIGN, [implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING, bad.handler]);
   const runId = start(h);
   assert.equal(await h.controller.run(runId), "paused");
   assert.match(String(h.controller.status(runId).stopReason), /ambiguous/);
   const before = h.pi.launches.length;
   h.pi.push(review(APPROVED));
   assert.equal(await h.controller.resume(runId), "REVIEWING");
+  // The report is still unusable when read again, so one fresh review replaces it.
   assert.equal(await h.controller.run(runId), "COMPLETED");
   assert.deepEqual(h.pi.launches.slice(before).map((l) => l.stepId), ["review"]);
+  assert.notEqual(h.controller.acceptedReview(runId)!.reportPath, bad.path());
+});
+
+test("an unusable review report fixed by hand is accepted on resume without another review", async () => {
+  const bad = proseReview();
+  const h = makeHarness(THREE_STEP_DESIGN, [implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING, bad.handler]);
+  const runId = start(h);
+  assert.equal(await h.controller.run(runId), "paused");
+  const before = h.pi.launches.length;
+  writeFileSync(bad.path(), "Fixed\n```qfb-review\n" + JSON.stringify({ ...APPROVED, verdict: "approve with comments" }) + "\n```\n");
+  await h.controller.resume(runId);
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  assert.equal(h.pi.launches.length, before, "no new review");
+  assert.equal(h.controller.acceptedReview(runId)!.reportPath, bad.path());
+});
+
+test("a held review report is dropped when the checkout changed since the review", async () => {
+  const bad = proseReview();
+  const h = makeHarness(THREE_STEP_DESIGN, [implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING, bad.handler]);
+  const runId = start(h);
+  assert.equal(await h.controller.run(runId), "paused");
+  const before = h.pi.launches.length;
+  // Even a now-valid report is about the old candidate.
+  writeFileSync(bad.path(), "```qfb-review\n" + JSON.stringify(APPROVED) + "\n```\n");
+  h.git.state.fingerprint = "fp-edited-by-hand";
+  h.pi.push(review(APPROVED));
+  await h.controller.resume(runId);
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  assert.deepEqual(h.pi.launches.slice(before).map((l) => l.stepId), ["review"]);
+  assert.equal(h.controller.acceptedCandidate(runId)!.fingerprint, "fp-edited-by-hand");
+  assert.notEqual(h.controller.acceptedReview(runId)!.reportPath, bad.path());
 });
 
 test("resume after a needs-discussion review goes straight back to review", async () => {

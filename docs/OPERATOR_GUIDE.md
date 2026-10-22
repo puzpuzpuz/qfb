@@ -241,7 +241,8 @@ QFB terminates the session it launched before exiting. Retry budgets persist acr
 - Review returned **needs-discussion** → paused for your decision.
 - `fix-pr` returned **Blocked / Diverging / Exhausted**, or claimed *Clean* but its tests fail when
   QFB re-runs them → failed (only a verified *Clean* advances).
-- A **stale** review result (the checkout changed during review) → paused; `qfb continue` reviews again.
+- A **stale** review result (the checkout changed during review) → paused; `qfb continue` reviews
+  again (in a terminal, it asks first).
 - The **final regression run** failed on the reviewed candidate → paused with the failing commands
   and logs (if a command is obsolete, remove it from `regression-suite.json`), then `qfb continue`.
 - The **review iteration limit**, a **hardening budget**, or the **hard session ceiling** was
@@ -255,7 +256,10 @@ QFB terminates the session it launched before exiting. Retry budgets persist acr
 - An artifact that does not belong to its session (wrong `runId`, `stepId`, or `kind`, or a
   `createdAt` before the session started) → treated as no artifact, with the reason recorded.
 - A review report with **zero or several** `qfb-review` blocks, duplicate finding IDs, or a verdict
-  that is not an approve, request-changes, or needs-discussion wording → paused as ambiguous.
+  that is not an approve, request-changes, or needs-discussion wording, or no report at all →
+  paused. The review's result is kept: `qfb continue` (in a terminal, after asking) reads it again,
+  so a report you fixed by hand, or a QFB upgrade that reads it, costs no new review. Only if it
+  still cannot be used, or the checkout changed since, does a fresh review run.
 - A session from an earlier controller is **still running** → reconciliation.
 
 ## Completion
