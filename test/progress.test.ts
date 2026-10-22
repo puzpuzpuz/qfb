@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { progressLines, phaseGroup, SPINNER } from "../src/progress.ts";
+import { progressLines, phaseGroup, SPINNER, titleText, titleSequence } from "../src/progress.ts";
 import type { StepView } from "../src/progress.ts";
 
 const steps: StepView[] = [
@@ -61,4 +61,18 @@ test("progressLines shows the agent session line outside implementation", () => 
   const last = lines[lines.length - 1]!;
   assert.match(last, /review: step=review/);
   assert.match(last, /running/);
+});
+
+test("titleText shows the work while running, and a stop or completion at a glance", () => {
+  const t = { runId: "run-1234abcd", stepsDone: 2, stepsTotal: 7, frame: 1 };
+  assert.equal(titleText({ ...t, state: "IMPLEMENTING" }), `${SPINNER[1]} qfb run-1234abcd \u00b7 implementation 2/7`);
+  assert.match(titleText({ ...t, state: "HARDENING_FIX_BUGS" }), /hardening 2\/7$/);
+  assert.notEqual(titleText({ ...t, state: "REVIEWING" }), titleText({ ...t, state: "REVIEWING", frame: 2 })); // spins
+  assert.equal(titleText({ ...t, state: "blocked" }), "\u23f8 qfb run-1234abcd \u00b7 needs you (blocked)");
+  assert.equal(titleText({ ...t, state: "COMPLETED" }), "\u2713 qfb run-1234abcd \u00b7 complete");
+});
+
+test("titleSequence sets the title with OSC 0 and cannot be escaped by its text", () => {
+  assert.equal(titleSequence("qfb"), "\x1b]0;qfb\x07");
+  assert.equal(titleSequence("a\x07b\x1b]0;evil\x9cc\n"), "\x1b]0;ab]0;evilc\x07");
 });

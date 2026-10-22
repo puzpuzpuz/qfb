@@ -51,6 +51,36 @@ export interface ProgressInput {
   frame: number;
 }
 
+export interface TitleInput {
+  runId: string;
+  state: string;
+  stepsDone: number;
+  stepsTotal: number;
+  frame: number;
+}
+
+const STOPPED = ["paused", "blocked", "failed", "reconciliation"];
+
+/**
+ * The terminal (tab) title: whether QFB is working or waiting on you, readable
+ * from a background tab. The important part comes first, as tabs truncate.
+ */
+export function titleText(i: TitleInput): string {
+  if (i.state === "COMPLETED") return `\u2713 qfb ${i.runId} \u00b7 complete`;
+  if (STOPPED.includes(i.state)) return `\u23f8 qfb ${i.runId} \u00b7 needs you (${i.state})`;
+  const spin = SPINNER[i.frame % SPINNER.length]!;
+  return `${spin} qfb ${i.runId} \u00b7 ${phaseGroup(i.state)} ${i.stepsDone}/${i.stepsTotal}`;
+}
+
+/** Save the current title on the terminal's title stack / restore it (xterm; ignored where unsupported). */
+export const TITLE_PUSH = "\x1b[22;0t";
+export const TITLE_POP = "\x1b[23;0t";
+
+/** The escape sequence (OSC 0) that sets the tab and window title, with control characters removed. */
+export function titleSequence(text: string): string {
+  return `\x1b]0;${text.replace(/[\x00-\x1f\x7f-\x9f]/g, "")}\x07`;
+}
+
 /** Build the compact progress block as an array of lines. */
 export function progressLines(input: ProgressInput): string[] {
   const spin = SPINNER[input.frame % SPINNER.length]!;

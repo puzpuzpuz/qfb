@@ -12,7 +12,7 @@ import { doctor } from "./doctor.ts";
 import { openPrIfNone } from "./pr.ts";
 import { State } from "./types.ts";
 import type { RunConfig, StateName } from "./types.ts";
-import { progressLines } from "./progress.ts";
+import { progressLines, titleText, titleSequence, TITLE_PUSH, TITLE_POP } from "./progress.ts";
 import type { StepView } from "./progress.ts";
 import { dbPath, artifactRoot, stateDir } from "./paths.ts";
 import { drive } from "./drive.ts";
@@ -543,7 +543,23 @@ function tailFile(path: string, n: number): string[] {
   }
 }
 
-/** Drive ctl.run(runId) while repainting a compact progress block in place. */
+let titleShown: string | null = null;
+
+/**
+ * Set the terminal tab title. The first call saves the operator's title, which
+ * comes back when QFB exits (signals exit via exitOnSignals()).
+ */
+function setTitle(text: string): void {
+  if (text === titleShown) return;
+  if (titleShown === null) {
+    process.stdout.write(TITLE_PUSH);
+    process.once("exit", () => process.stdout.write(TITLE_POP));
+  }
+  process.stdout.write(titleSequence(text));
+  titleShown = text;
+}
+
+/** Drive ctl.run(runId) while repainting a compact progress block (and the tab title) in place. */
 async function runWithProgress(ctl: Controller, runId: string, enabled: boolean): Promise<StateName> {
   const interactive = enabled && Boolean(process.stdout.isTTY);
   let frame = 0;
@@ -574,6 +590,14 @@ async function runWithProgress(ctl: Controller, runId: string, enabled: boolean)
       buf += "\x1b[0J"; // clear everything below
       buf += lines.join("\n") + "\n";
       process.stdout.write(buf);
+      // Stays after the run settles: "complete", or "needs you" while drive() asks.
+      setTitle(titleText({
+        runId,
+        state: String(status.state),
+        stepsDone: Number(status.stepsDone),
+        stepsTotal: Number(status.stepsTotal),
+        frame,
+      }));
       drawn = lines.length;
       frame++;
     } else {
