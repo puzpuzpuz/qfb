@@ -313,6 +313,12 @@ export interface TestRun {
   command: string;
   exitCode: number;
   logPath?: string;
+  /**
+   * Not a lasting test: a check of behavior the plan will change (a baseline
+   * repro) or a throwaway diagnostic. Re-run and gated when claimed like any
+   * command, but kept out of the regression suite re-run on the final candidate.
+   */
+  oneOff?: boolean;
 }
 
 /** A claimed validation command re-run by the controller, with its REAL exit code. */
@@ -321,6 +327,8 @@ export interface VerifiedTest {
   claimedExitCode: number;
   exitCode: number;
   logPath: string;
+  /** The agent marked it a one-off check (see TestRun.oneOff). */
+  oneOff?: boolean;
 }
 
 export interface Finding {

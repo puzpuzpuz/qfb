@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { makeHarness, artifact, THREE_STEP_DESIGN } from "./helpers.ts";
 import { PlanChangedError } from "../src/controller.ts";
 import type { Harness, PiHandler } from "./helpers.ts";
+import type { TestRun } from "../src/types.ts";
 import type { PiLaunchRequest } from "../src/adapters/pi.ts";
 
 /** Impl handler: mutates git to simulate a code change and claims DONE. */
@@ -691,6 +692,44 @@ test("completion requires the accumulated regression suite to pass on the review
   assert.equal(await h.controller.run(runId), "paused");
   assert.match(String(h.controller.status(runId).stopReason), /Final regression run failed/);
   assert.equal(h.controller.acceptedCandidate(runId), null);
+});
+
+test("the regression suite keeps each lasting test once: one-off checks and redirect-only variants stay out", async () => {
+  const cmd = (command: string, oneOff = false): TestRun => ({ command, exitCode: 0, ...(oneOff ? { oneOff } : {}) });
+  const step = (stepId: string, testCommands: TestRun[]): PiHandler => (_req, git) => {
+    git.state.fingerprint = `fp-${stepId}`;
+    return { artifact: artifact({ stepId, testCommands }) };
+  };
+  let runId = "";
+  let stored: string[] = [];
+  const suitePath = () => join(h.dir, "artifacts", runId, "regression-suite.json");
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    // A baseline repro of behavior the plan changes: verified now, never a regression test.
+    step("S1", [cmd("bash scratch/lv-baseline-repro.sh", true), cmd("mvn -Dtest=A test > /logs/s1.log 2>&1")]),
+    step("S2", [cmd("mvn -Dtest=A test > /logs/s2.log 2>&1"), cmd("mvn -Dtest=B test")]),
+    step("S3", [cmd("mvn -Dtest=B   test >> /logs/s3.log")]),
+    ...HAPPY_HARDENING,
+    (req, git) => {
+      stored = JSON.parse(readFileSync(suitePath(), "utf8"));
+      // An older suite, or an operator's edit, may still list a test twice.
+      writeFileSync(suitePath(), JSON.stringify([...stored, "mvn -Dtest=A test &> /logs/older.log"]));
+      return review(APPROVED)(req, git);
+    },
+  ]);
+  runId = start(h);
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  assert.match(h.pi.launches[0]!.prompt, /Set oneOff: true on a command that is not a lasting test/);
+
+  const claimed = [
+    "bash scratch/lv-baseline-repro.sh", "mvn -Dtest=A test > /logs/s1.log 2>&1",
+    "mvn -Dtest=A test > /logs/s2.log 2>&1", "mvn -Dtest=B test",
+    "mvn -Dtest=B   test >> /logs/s3.log",
+    "mvn -q test -pl core",
+  ];
+  const lasting = ["mvn -Dtest=A test > /logs/s1.log 2>&1", "mvn -Dtest=B test", "mvn -q test -pl core"];
+  assert.deepEqual(stored, lasting);
+  // Every claimed command, the one-off included, was re-run when claimed; the final run is each lasting test once.
+  assert.deepEqual(h.tests.ran, [...claimed, ...lasting]);
 });
 
 test("commit policy checkpoints every verified writer stage (incl. hardening and fix-pr) and keeps deny-listed text out of messages", async () => {

@@ -139,7 +139,10 @@ Agents report the validation commands they ran; QFB **re-runs every one itself**
 and gates on the real exit code (a claimed exit code that differs rejects the work). Logs land next
 to the session's artifact as `*.verify-N.log`. Each accepted command joins the run's regression
 suite (`artifacts/<run-id>/regression-suite.json`), which is re-run on the reviewed candidate before
-the run may complete.
+the run may complete. Two exceptions keep the suite meaningful and its run short. A command the
+agent marks `oneOff` (a baseline repro of behavior the plan changes, a throwaway diagnostic) is
+verified when claimed but never kept. A command that differs from one already in the suite only in
+where it sends its output (`> step3.log 2>&1`) counts as the same test and runs once.
 
 It runs unattended while decisions are routine. It **pauses** when it needs an architectural,
 product, compatibility, scope, or safety decision, and **fails** (preserving evidence) when a budget

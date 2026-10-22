@@ -13,6 +13,7 @@ import { canTransition, assertTransition, resumeTarget } from "../src/stateMachi
 import { checkArtifact, confidentialityFailures, mechanicalGate, validateArtifact } from "../src/gating.ts";
 import type { GateInput } from "../src/gating.ts";
 import { DEFAULT_CONFIG, State, validateConfig } from "../src/types.ts";
+import { regressionKey } from "../src/controller.ts";
 import type { AddedContent, GitSnapshot, TaskArtifact, UnscannableFile, VerifiedTest } from "../src/types.ts";
 
 const snap = (over: Partial<GitSnapshot> = {}): GitSnapshot => ({
@@ -508,4 +509,25 @@ test("checkArtifact: an agent's decision request is normalized; a malformed one 
   assert.equal(withDecision({ options: ["A"] }), undefined);
   assert.equal(withDecision("just text"), undefined);
   assert.equal(withDecision({ question: "Q", options: ["A"], recommended: 4 })!.recommended, null);
+});
+
+test("regressionKey: only where a command sends its output is ignored", () => {
+  const same = [
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*Test' test",
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*Test' test > /s/s2a2-lv-package.log 2>&1",
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*Test'   test >> /s/s3.log",
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*Test' test 2>&1 >\"/s/with space.log\"",
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*Test' test &> /s/x.log",
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*Test' test 2>/dev/null",
+  ];
+  for (const c of same) assert.equal(regressionKey(c), regressionKey(same[0]!), c);
+  // Anything that changes what runs, or what decides the exit code, is a different command.
+  for (const c of [
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*Test' test | tee /s/x.log",
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*Test' test < /s/input.txt",
+    "mvn -pl core -o -Dtest='io.questdb.test.cairo.lv.*FuzzTest' test > /s/x.log",
+    "sh -c \"mvn -pl core test > /s/x.log\"",
+  ]) {
+    assert.notEqual(regressionKey(c), regressionKey(same[0]!), c);
+  }
 });

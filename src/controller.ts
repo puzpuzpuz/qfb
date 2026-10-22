@@ -1934,7 +1934,7 @@ export class Controller {
       const t = a.testCommands[i]!;
       const logPath = `${row.artifactPath}.verify-${i + 1}.log`;
       const exitCode = await this.runTest(t.command, run.repoPath, logPath, run.config.testTimeoutMs);
-      out.push({ command: t.command, claimedExitCode: t.exitCode, exitCode, logPath });
+      out.push({ command: t.command, claimedExitCode: t.exitCode, exitCode, logPath, ...(t.oneOff === true ? { oneOff: true } : {}) });
     }
     return out;
   }
@@ -1943,20 +1943,39 @@ export class Controller {
     return this.artifactPath(runId, "regression-suite.json");
   }
 
-  /** Accumulate every verified command; all must pass on the final candidate. */
+  /**
+   * Accumulate the verified lasting commands; all must pass on the final
+   * candidate. One-off checks stay out, and so does a command that differs from
+   * one already in the suite only in where it sends its output.
+   */
   private rememberTests(runId: string, verified: VerifiedTest[]): void {
     const suite = this.readSuite(runId);
-    for (const t of verified) if (!suite.includes(t.command)) suite.push(t.command);
+    const keys = new Set(suite.map(regressionKey));
+    for (const t of verified) {
+      const key = regressionKey(t.command);
+      if (t.oneOff || keys.has(key)) continue;
+      keys.add(key);
+      suite.push(t.command);
+    }
     writeFileSync(this.suitePath(runId), JSON.stringify(suite, null, 2) + "\n");
   }
 
+  /** The suite, each command once (the first of any that differ only in output redirection). */
   private readSuite(runId: string): string[] {
+    let stored: string[];
     try {
       const v = JSON.parse(readFileSync(this.suitePath(runId), "utf8"));
-      return Array.isArray(v) ? v.filter((c): c is string => typeof c === "string") : [];
+      stored = Array.isArray(v) ? v.filter((c): c is string => typeof c === "string") : [];
     } catch {
       return [];
     }
+    const seen = new Set<string>();
+    return stored.filter((c) => {
+      const key = regressionKey(c);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   private async runRegressionSuite(run: RunRow, row: SessionRow): Promise<VerifiedTest[]> {
@@ -2135,6 +2154,9 @@ export class Controller {
     `- Never run concurrent Maven invocations. Treat java-questdb-client/ as a separate repo.`,
     `- List EVERY validation command you ran in testCommands, as the exact command line run from the repository root.`,
     `  QFB re-runs each one itself and gates on the REAL exit code; a claimed exit code that differs rejects the result.`,
+    `- Set oneOff: true on a command that is not a lasting test: a check of behavior this plan will change (such as a`,
+    `  baseline repro of the current behavior) or a throwaway diagnostic. QFB still re-runs it now; only lasting commands`,
+    `  (tests, and the setup steps they need) join the regression suite re-run on the final candidate.`,
   ];
 
   /** The identity fields QFB checks on every artifact (a mismatch rejects it). */
@@ -2176,7 +2198,7 @@ export class Controller {
       ...this.rules(run),
       `- When done, write a typed JSON TaskArtifact to: ${artifactPath}`,
       `  with fields: {runId, stepId, kind, status, summary, changedFiles[],`,
-      `  testCommands[{command,exitCode}], limitations[], notableDecisions[], decision?, createdAt}.`,
+      `  testCommands[{command,exitCode,oneOff?}], limitations[], notableDecisions[], decision?, createdAt}.`,
       ...Controller.identity(run.id, step.id, "implementation"),
       `- status MUST be one of DONE | BLOCKED | NEEDS_DECISION | FAILED.`,
     ].join("\n");
@@ -2216,7 +2238,7 @@ export class Controller {
       `Rules:`,
       ...this.rules(run),
       `Write a typed JSON TaskArtifact to ${artifactPath} with status DONE | BLOCKED | NEEDS_DECISION | FAILED`,
-      `and fields {runId, stepId, kind, status, summary, changedFiles[], testCommands[{command,exitCode}], limitations[],`,
+      `and fields {runId, stepId, kind, status, summary, changedFiles[], testCommands[{command,exitCode,oneOff?}], limitations[],`,
       `notableDecisions[], bugs[], handoffPath, decision?, createdAt}.`,
       ...Controller.identity(run.id, stepId, stage === State.HARDENING_IDENTIFY ? "coverage-gap" : "bug"),
     ].join("\n");
@@ -2280,6 +2302,24 @@ export class Controller {
       ...Controller.identity(run.id, "fix", "fix"),
     ].join("\n");
   }
+}
+
+/** Trailing output redirection: `> f`, `>> f`, `2> f`, `&> f` (path bare or quoted), or `2>&1`. */
+const TRAILING_OUTPUT_REDIRECT = /\s+(?:\d*>>?|&>>?)\s*(?:"[^"]*"|'[^']*'|[^\s"'|&;<>]+)\s*$|\s+\d*>&\d+\s*$/;
+
+/**
+ * A command's identity in the regression suite: the command without trailing
+ * output redirections, whitespace collapsed. Agents send each run's output to
+ * a new log file; that does not make it a different test. Input redirections
+ * and pipes are kept: they change what runs.
+ */
+export function regressionKey(command: string): string {
+  let c = command.trim();
+  for (let prev = ""; prev !== c; ) {
+    prev = c;
+    c = c.replace(TRAILING_OUTPUT_REDIRECT, "");
+  }
+  return c.replace(/\s+/g, " ");
 }
 
 /** A `git diff --no-index` of two files, with readable labels instead of the file paths. */
