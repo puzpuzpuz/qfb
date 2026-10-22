@@ -83,7 +83,8 @@ What `qfb build` does, in order:
 5. **Orchestrates** serial implementation → hardening → review/fix → completion.
 6. **Opens a PR** for the branch if none is open (disable with `--no-pr`). It pushes only the exact
    commit the final review accepted, from a clean tree, and refuses PR text containing deny-listed
-   terms. Because a PR needs commits, `build` uses commit checkpoints unless you pass `--no-pr`.
+   terms. The approving review is posted on the PR as a comment (once per accepted commit; never
+   when it contains a deny-listed term). Because a PR needs commits, `build` uses commit checkpoints unless you pass `--no-pr`.
 
 While it runs, `build` shows a **self-refreshing compact progress view** — a
 phase bar (implementation ▸ hardening ▸ review/fix), per-step markers

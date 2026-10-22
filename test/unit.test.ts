@@ -107,6 +107,36 @@ test("report: approved + passing gate + no critical is acceptable", () => {
   assert.equal(isAcceptable(parseReviewReport(raw), false), true);
 });
 
+test("report: every approve variation is an approval; other verdicts map by their leading words", () => {
+  const parse = (verdict: unknown) =>
+    parseReviewReport("```qfb-review\n" + JSON.stringify({ verdict, testGatePassed: true, findings: [] }) + "\n```");
+  for (const v of [
+    "approve", "approved", "Approve with comments", "approve with comments", "APPROVED WITH COMMENTS",
+    "approve-with-comments", "approve_with_nits", "Approved, with minor suggestions.", "**Approve** (with comments)",
+    "approves", "LGTM", "pass", "clean",
+  ]) {
+    assert.equal(parse(v).verdict, "approved", v);
+  }
+  assert.equal(parse("approve with comments").verdictLabel, "approve with comments");
+  for (const v of ["request changes", "Request changes", "requested changes", "changes-requested", "changes requested", "blocking", "blocked", "reject"]) {
+    assert.equal(parse(v).verdict, "blocking", v);
+  }
+  for (const v of ["needs discussion", "needs-discussion", "Needs discussion", "needs_decision", "discuss"]) {
+    assert.equal(parse(v).verdict, "needs-discussion", v);
+  }
+  // A negated or unknown verdict is never read as an approval: the run pauses.
+  for (const v of ["not approved", "do not approve", "unapproved", "disapprove", "maybe", "", 1, null]) {
+    assert.throws(() => parse(v), /Unrecognized verdict/, String(v));
+  }
+});
+
+test("report: an approval with an admitted Critical finding is still not acceptable", () => {
+  const raw = "```qfb-review\n" + JSON.stringify({ verdict: "approve with comments", testGatePassed: true, findings: [
+    { id: "C1", severity: "critical", location: "A.java:1", evidence: "npe" },
+  ] }) + "\n```";
+  assert.equal(isAcceptable(parseReviewReport(raw), false), false);
+});
+
 test("report: ambiguous surface pauses (throws)", () => {
   assert.throws(() => parseReviewReport("just prose, no block"), AmbiguousReportError);
   assert.throws(() => parseReviewReport("```qfb-review\nnot json\n```"), AmbiguousReportError);

@@ -9,7 +9,7 @@ import { Git } from "./git.ts";
 import { RpcPiAdapter } from "./adapters/pi.ts";
 import { CliHerdrAdapter, NullHerdrAdapter } from "./adapters/herdr.ts";
 import { doctor } from "./doctor.ts";
-import { openPrIfNone } from "./pr.ts";
+import { openPrIfNone, postReviewComment } from "./pr.ts";
 import { State } from "./types.ts";
 import type { RunConfig, StateName } from "./types.ts";
 import { progressLines, titleText, titleSequence, TITLE_PUSH, TITLE_POP } from "./progress.ts";
@@ -460,6 +460,7 @@ async function finishRun(ctl: Controller, runId: string): Promise<number> {
     out(pr.opened ? `\n\u2713 Opened PR: ${pr.url}` : `\nPR: ${pr.reason}${pr.url ? ` (${pr.url})` : ""}`);
     // Success means a PR now carries the accepted commit (a new one, or an open one we pushed to).
     if (!pr.opened && !(pr.pushed && pr.url)) return 3;
+    if (pr.url) postAcceptedReview(ctl, runId, final.repoPath, pr.url, final.denyList);
   }
   const local = ctl.localDocs(runId);
   if (local.length > 0) {
@@ -467,6 +468,28 @@ async function finishRun(ctl: Controller, runId: string): Promise<number> {
   }
   out(`\n\u2713 Feature complete: ${runId}`);
   return 0;
+}
+
+/**
+ * Post the approving review on the PR, once per PR and accepted commit. A
+ * failure is reported but does not fail the run: the PR already carries the
+ * commit, and the next 'qfb continue' tries again.
+ */
+function postAcceptedReview(ctl: Controller, runId: string, repoPath: string, url: string, denyList: string[]): void {
+  const out = (s: string) => process.stdout.write(s + "\n");
+  if (ctl.reviewPosted(runId, url)) return;
+  const review = ctl.acceptedReview(runId);
+  if (!review) {
+    out("Review not posted on the PR: no approving review of the accepted commit is recorded.");
+    return;
+  }
+  const r = postReviewComment(repoPath, url, runId, review, denyList);
+  if (r.posted) {
+    ctl.markReviewPosted(runId, url);
+    out("\u2713 Posted the approving review on the PR.");
+  } else {
+    out(`Review not posted on the PR: ${r.reason}.${r.retryable ? ` 'qfb continue ${runId}' tries again.` : ""}`);
+  }
 }
 
 /** Human-readable status, with why the run stopped and what to do about it. */

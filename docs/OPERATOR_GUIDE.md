@@ -133,7 +133,8 @@ qfb run run-xxxxxxxx
 QFB acquires an exclusive run lock, then drives: serial implementation (one fresh Pi session per
 step, mechanically gated and checkpointed) → test-coverage hardening (identify gaps → write
 adversarial tests → fix exposed bugs) → stabilization (`review-pr` ⇄ `fix-pr` until an acceptable
-verdict with a passing test gate) → `COMPLETED`.
+verdict with a passing test gate) → `COMPLETED`. Any approve verdict (`approve`, `approve with
+comments`, ...) is an approval; whether it is acceptable still depends on its findings.
 
 Agents report the validation commands they ran; QFB **re-runs every one itself**, one at a time,
 and gates on the real exit code (a claimed exit code that differs rejects the work). Logs land next
@@ -253,17 +254,19 @@ QFB terminates the session it launched before exiting. Retry budgets persist acr
   (see §6).
 - An artifact that does not belong to its session (wrong `runId`, `stepId`, or `kind`, or a
   `createdAt` before the session started) → treated as no artifact, with the reason recorded.
-- A review report with **zero or several** `qfb-review` blocks, or duplicate finding IDs → paused
-  as ambiguous.
+- A review report with **zero or several** `qfb-review` blocks, duplicate finding IDs, or a verdict
+  that is not an approve, request-changes, or needs-discussion wording → paused as ambiguous.
 - A session from an earlier controller is **still running** → reconciliation.
 
 ## Completion
 
 On `COMPLETED`, `qfb status` reflects completed steps and review history; `qfb logs` points at the
 full evidence. `qfb run` **does not** push, open/merge PRs, or deploy — that remains your decision.
-`qfb build` (unless `--no-pr`) pushes the accepted commit and opens a PR, nothing else. If a PR is
-already open for the branch, it still pushes the accepted commit (never forced), so the PR is not
-left behind.
+`qfb build` (unless `--no-pr`) pushes the accepted commit, opens a PR, and posts the approving
+review on it as a comment, nothing else. If a PR is already open for the branch, it still pushes the
+accepted commit (never forced), so the PR is not left behind. The review comment is the full
+`review-pr` report (without its `qfb-review` block), posted once per PR and accepted commit; it is
+not posted if it contains a deny-listed term, and a failed post is retried by `qfb continue RUN_ID`.
 
 ## Cleaning up
 

@@ -340,6 +340,8 @@ export interface Finding {
 
 export interface ReviewReport {
   verdict: VerdictName;
+  /** The verdict as the review worded it, e.g. "approve with comments". */
+  verdictLabel: string;
   findings: Finding[];
   testGatePassed: boolean;
   raw: string;

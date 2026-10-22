@@ -1,6 +1,8 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { scanForDenyTerms } from "./confidentiality.ts";
-import type { GitLike, AcceptedCandidate } from "./controller.ts";
+import { parseReviewReport } from "./report.ts";
+import type { GitLike, AcceptedCandidate, AcceptedReview } from "./controller.ts";
 
 export interface PrResult {
   opened: boolean;
@@ -103,4 +105,66 @@ export function openPrIfNone(repoPath: string, git: Pick<GitLike, "branch" | "he
   } catch (e) {
     return { opened: false, pushed: true, reason: `pushed, but gh pr create failed: ${firstLine(e)}` };
   }
+}
+
+/** GitHub rejects comments over 65,536 characters; keep clear of it. */
+const MAX_COMMENT = 60_000;
+
+/**
+ * The PR comment for the approving review: a header naming the run and the
+ * reviewed commit, then the report itself, without its qfb-review block (the
+ * machine-readable copy of what the report already says).
+ */
+export function reviewCommentBody(runId: string, review: AcceptedReview, raw: string): string {
+  let label = "approve";
+  try {
+    label = parseReviewReport(raw).verdictLabel;
+  } catch {
+    // The report was parsed when the review was accepted; keep the generic label.
+  }
+  const header =
+    `### QFB review: ${label}\n\n` +
+    `Final review (iteration ${review.iteration}) of \`${review.head.slice(0, 12)}\` by QFB run \`${runId}\`.\n\n---\n\n`;
+  let report = raw.replace(/```qfb-review[ \t]*\r?\n[\s\S]*?```[ \t]*\r?\n?/g, "").trim();
+  const room = MAX_COMMENT - header.length;
+  if (report.length > room) {
+    const note = `\n\n_(Truncated; the full report is in QFB's artifacts for run \`${runId}\`.)_`;
+    report = report.slice(0, room - note.length) + note;
+  }
+  return header + report + "\n";
+}
+
+export interface ReviewPostResult {
+  posted: boolean;
+  /** Trying again later may succeed (it cannot when the report has a deny-listed term). */
+  retryable: boolean;
+  reason: string;
+}
+
+/**
+ * Post the approving review on the PR as a comment. Like the PR text, the
+ * comment is refused when it contains a deny-listed term.
+ */
+export function postReviewComment(repoPath: string, prUrl: string, runId: string, review: AcceptedReview, denyList: string[]): ReviewPostResult {
+  let raw: string;
+  try {
+    raw = readFileSync(review.reportPath, "utf8");
+  } catch (e) {
+    return { posted: false, retryable: true, reason: `cannot read the review report ${review.reportPath}: ${(e as Error).message}` };
+  }
+  const body = reviewCommentBody(runId, review, raw);
+  const leaks = scanForDenyTerms(body, denyList);
+  if (leaks.length > 0) {
+    return {
+      posted: false,
+      retryable: false,
+      reason: `the review report contains deny-listed term(s) ${leaks.map((m) => `"${m.term}"`).join(", ")}; not posted (report: ${review.reportPath})`,
+    };
+  }
+  try {
+    execFileSync("gh", ["pr", "comment", prUrl, "--body-file", "-"], { cwd: repoPath, input: body, stdio: ["pipe", "ignore", "pipe"] });
+  } catch (e) {
+    return { posted: false, retryable: true, reason: `gh pr comment failed: ${(e as Error).message.split("\n")[0]}` };
+  }
+  return { posted: true, retryable: false, reason: "posted the approving review on the PR" };
 }

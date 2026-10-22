@@ -361,6 +361,28 @@ test("a BLOCKED step can be unblocked by the operator and resumed to completion"
   assert.equal(h.controller.status(runId).stepsDone, 3);
 });
 
+test("an 'approve with comments' review completes the run and is the accepted review build posts", async () => {
+  const h = makeHarness(THREE_STEP_DESIGN, [
+    implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING,
+    review({ verdict: "approve with comments", testGatePassed: true, findings: [
+      { id: "MOD-1", severity: "Moderate", location: "A.java:1", evidence: "x" },
+    ] }),
+  ]);
+  const runId = start(h);
+  assert.equal(h.controller.acceptedReview(runId), null);
+  assert.equal(await h.controller.run(runId), "COMPLETED");
+  const r = h.controller.acceptedReview(runId)!;
+  assert.equal(r.iteration, 1);
+  assert.equal(r.head, h.controller.acceptedCandidate(runId)!.head);
+  assert.match(readFileSync(r.reportPath, "utf8"), /"verdict":"approve with comments"/);
+  // Posted once per PR and accepted commit.
+  assert.equal(h.controller.reviewPosted(runId, "https://example.test/pr/1"), false);
+  h.controller.markReviewPosted(runId, "https://example.test/pr/1");
+  h.controller.markReviewPosted(runId, "https://example.test/pr/1");
+  assert.equal(h.controller.reviewPosted(runId, "https://example.test/pr/1"), true);
+  assert.equal(h.controller.reviewPosted(runId, "https://example.test/pr/2"), false);
+});
+
 test("review that is unacceptable with no actionable findings pauses for a human", async () => {
   const h = makeHarness(THREE_STEP_DESIGN, [
     implDone("S1"), implDone("S2"), implDone("S3"), ...HAPPY_HARDENING,

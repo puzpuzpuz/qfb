@@ -46,7 +46,7 @@ export function parseReviewReport(raw: string): ReviewReport {
 
   const findings = parseFindings(obj.findings);
 
-  return { verdict, findings, testGatePassed: obj.testGatePassed, raw };
+  return { verdict, verdictLabel: (obj.verdict as string).trim(), findings, testGatePassed: obj.testGatePassed, raw };
 }
 
 function parseFindings(value: unknown): Finding[] {
@@ -82,14 +82,24 @@ function extractBlocks(raw: string, tag: string): string[] {
   return [...raw.matchAll(re)].map((m) => m[1]!.trim());
 }
 
+/**
+ * The verdict a label names, decided by its leading words: review-pr writes
+ * "approve", "approve with comments", "request changes" or "needs discussion",
+ * and agents vary the wording ("Approved, with nits", "approve_with_comments").
+ * Every approve variation is an approval; its findings still decide whether it
+ * is acceptable (see isAcceptable). Anything else, including a negated approval
+ * ("not approved"), is unrecognized, so the run pauses rather than guessing.
+ */
 function normalizeVerdict(v: unknown): VerdictName | null {
   if (typeof v !== "string") return null;
-  const s = v.trim().toLowerCase();
-  if (["approved", "approve", "pass", "clean"].includes(s)) return Verdict.APPROVED;
-  if (["blocking", "blocked", "changes-requested", "reject"].includes(s)) return Verdict.BLOCKING;
-  if (["needs-discussion", "needs discussion", "discuss", "needs_decision"].includes(s)) {
-    return Verdict.NEEDS_DISCUSSION;
+  const s = v.toLowerCase().replace(/[^a-z]+/g, " ").trim();
+  if (/^(approved?|approves|approving|lgtm)\b/.test(s) || ["pass", "passed", "clean"].includes(s)) {
+    return Verdict.APPROVED;
   }
+  if (/^(block(s|ed|ing)?|reject(s|ed)?|requests? changes|requested changes|changes? requested)\b/.test(s)) {
+    return Verdict.BLOCKING;
+  }
+  if (/^(needs? (discussion|decision)|discuss(ion)?)\b/.test(s)) return Verdict.NEEDS_DISCUSSION;
   return null;
 }
 

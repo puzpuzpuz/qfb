@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { shellTestRunner, groupAlive } from "../src/procs.ts";
 import { RpcPiAdapter } from "../src/adapters/pi.ts";
 import { Git } from "../src/git.ts";
-import { pushBlocker, openPrIfNone } from "../src/pr.ts";
+import { pushBlocker, openPrIfNone, postReviewComment, reviewCommentBody } from "../src/pr.ts";
 import type { PrRequest } from "../src/pr.ts";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "qfb-procs-"));
@@ -191,6 +191,50 @@ test("openPrIfNone pushes the accepted commit to an already-open PR instead of l
   assert.match(r.reason, /pushed the accepted commit to the already-open PR/);
   assert.equal(execFileSync("git", ["rev-parse", "feature/x"], { cwd: remote, encoding: "utf8" }).trim(), head);
   assert.throws(() => readFileSync(created), "no second PR is created");
+});
+
+const REVIEW_REPORT =
+  "# Review\n\nLooks good.\n\n- **Verdict: approve with comments.**\n\n" +
+  "```qfb-review\n" + JSON.stringify({ verdict: "approve with comments", testGatePassed: true, findings: [] }) + "\n```\n";
+
+test("postReviewComment posts the approving review, without its qfb-review block, on the PR", () => {
+  const d = tmp();
+  const reportPath = join(d, "review-5.json.report.md");
+  writeFileSync(reportPath, REVIEW_REPORT);
+  const argsFile = join(d, "gh-args");
+  const bodyFile = join(d, "gh-body");
+  fakeBin(tmp(), "gh", `printf '%s\\n' "$@" > ${argsFile}; cat > ${bodyFile}`);
+  const review = { iteration: 5, reportPath, head: "7709a41f44c3313a034a43b9459e41ca5bd4a126" };
+  const r = postReviewComment(d, "https://example.test/pr/7", "run-1", review, ["AcmeCorp"]);
+  assert.deepEqual([r.posted, r.retryable], [true, false]);
+  assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), ["pr", "comment", "https://example.test/pr/7", "--body-file", "-"]);
+  const body = readFileSync(bodyFile, "utf8");
+  assert.match(body, /^### QFB review: approve with comments\n/);
+  assert.match(body, /iteration 5\) of `7709a41f44c3` by QFB run `run-1`/);
+  assert.match(body, /Looks good\.[\s\S]*Verdict: approve with comments/);
+  assert.doesNotMatch(body, /qfb-review|testGatePassed/);
+
+  // A deny-listed term in the report: nothing is posted.
+  writeFileSync(reportPath, REVIEW_REPORT.replace("Looks good.", "Covers the AcmeCorp table."));
+  writeFileSync(bodyFile, "");
+  const leak = postReviewComment(d, "https://example.test/pr/7", "run-1", review, ["AcmeCorp"]);
+  assert.deepEqual([leak.posted, leak.retryable], [false, false]);
+  assert.match(leak.reason, /deny-listed term\(s\) "AcmeCorp"/);
+  assert.equal(readFileSync(bodyFile, "utf8"), "");
+
+  // gh failing is reported, and worth retrying.
+  writeFileSync(reportPath, REVIEW_REPORT);
+  fakeBin(tmp(), "gh", "echo 'HTTP 502' >&2; exit 1");
+  const failed = postReviewComment(d, "https://example.test/pr/7", "run-1", review, []);
+  assert.deepEqual([failed.posted, failed.retryable], [false, true]);
+  assert.match(failed.reason, /gh pr comment failed/);
+});
+
+test("reviewCommentBody keeps a long report under GitHub's comment limit", () => {
+  const raw = "# Review\n\n" + "x".repeat(100_000) + "\n\n" + REVIEW_REPORT;
+  const body = reviewCommentBody("run-1", { iteration: 1, reportPath: "/r", head: "abc" }, raw);
+  assert.ok(body.length <= 60_001, `${body.length}`);
+  assert.match(body, /Truncated; the full report is in QFB's artifacts for run `run-1`/);
 });
 
 test("CLI: --level is validated (no NaN or out-of-range review level reaches a run)", () => {

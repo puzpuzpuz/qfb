@@ -18,7 +18,7 @@ import { foldForMatch, scanForDenyTerms } from "./confidentiality.ts";
 import { Git, GitError, diffFiles } from "./git.ts";
 import { shellTestRunner } from "./procs.ts";
 import type { TestRunner } from "./procs.ts";
-import { State, AgentStatus, FixOutcome, DEFAULT_CONFIG, validateConfig } from "./types.ts";
+import { State, AgentStatus, FixOutcome, Verdict, DEFAULT_CONFIG, validateConfig } from "./types.ts";
 import type { PiAdapter } from "./adapters/pi.ts";
 import type { HerdrAdapter } from "./adapters/herdr.ts";
 import type {
@@ -91,6 +91,15 @@ export interface AcceptedCandidate {
   branch: string;
   head: string;
   fingerprint: string;
+}
+
+/** The approving review of the accepted candidate; `build` posts it on the PR. */
+export interface AcceptedReview {
+  iteration: number;
+  /** The complete raw review-pr report. */
+  reportPath: string;
+  /** The reviewed commit. */
+  head: string;
 }
 
 /** The plan as currently prepared for approval. */
@@ -173,6 +182,8 @@ const STOP_REQUEST = "request-stop";
 /** Highest session row id at the last operator retry of a FAILED run; budgets count sessions after it. */
 const BUDGET_EPOCH = "budget-epoch";
 const ACCEPTED = "accepted-candidate";
+/** PRs (url + accepted head) the approving review was posted on. */
+const REVIEW_POSTED = "review-posted";
 /** Hash of the design text the stored steps were extracted from. */
 const PLAN_SOURCE_HASH = "plan-source-hash";
 /** JSON notes explaining why the stored plan is ambiguous; absent when it is not. */
@@ -1681,6 +1692,31 @@ export class Controller {
     return v ? (JSON.parse(v) as AcceptedCandidate) : null;
   }
 
+  /** The approving review of the accepted candidate (null unless COMPLETED). */
+  acceptedReview(runId: string): AcceptedReview | null {
+    const accepted = this.acceptedCandidate(runId);
+    if (!accepted) return null;
+    const r = this.store
+      .getReviews(runId)
+      .findLast((x) => x.verdict === Verdict.APPROVED && x.candidate_fingerprint === accepted.fingerprint && x.raw_path);
+    return r ? { iteration: r.iteration as number, reportPath: r.raw_path as string, head: accepted.head } : null;
+  }
+
+  /** Whether the accepted review was already posted on the PR at `url`. */
+  reviewPosted(runId: string, url: string): boolean {
+    const head = this.acceptedCandidate(runId)?.head;
+    const posted = JSON.parse(this.store.getCounter(runId, REVIEW_POSTED) ?? "[]") as { url: string; head: string }[];
+    return posted.some((p) => p.url === url && p.head === head);
+  }
+
+  /** Remember that the accepted review is on the PR at `url`, so finishing again does not repeat it. */
+  markReviewPosted(runId: string, url: string): void {
+    const head = this.acceptedCandidate(runId)?.head;
+    if (!head || this.reviewPosted(runId, url)) return;
+    const posted = JSON.parse(this.store.getCounter(runId, REVIEW_POSTED) ?? "[]") as { url: string; head: string }[];
+    this.store.setCounter(runId, REVIEW_POSTED, JSON.stringify([...posted, { url, head }]));
+  }
+
   /**
    * Extra, human-oriented detail for `status --verbose`: the current/last Pi
    * session (id, kind, step, status, transcript path) and the recent phase
@@ -2253,6 +2289,7 @@ export class Controller {
       `Write the COMPLETE raw report to ${artifactPath}.report.md and set reviewReportPath to that path.`,
       `The report MUST contain exactly ONE machine-readable fenced \`\`\`qfb-review JSON block (never quote or`,
       `repeat it) with {verdict, testGatePassed, findings:[{id,severity,location,evidence}]}; finding ids must be unique.`,
+      `verdict is the report's verdict: "approve", "approve with comments", "request changes" or "needs discussion".`,
       `Write a typed JSON TaskArtifact (status DONE) to ${artifactPath}.`,
       ...Controller.identity(run.id, "review", "review"),
     ].join("\n");
